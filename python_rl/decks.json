@@ -1,0 +1,3155 @@
+{
+  "yularen-droid": {
+  "metadata": {
+    "name": "droids go brrrrr - pq",
+    "author": "Vayllle"
+  },
+  "leader": {
+    "id": "SEC_006",
+    "count": 1
+  },
+  "base": {
+    "id": "LAW_025",
+    "count": 1
+  },
+  "deck": [
+    {
+      "id": "LOF_191",
+      "count": 2
+    },
+    {
+      "id": "JTL_106",
+      "count": 2
+    },
+    {
+      "id": "LOF_155",
+      "count": 3
+    },
+    {
+      "id": "LOF_091",
+      "count": 2
+    },
+    {
+      "id": "LAW_053",
+      "count": 2
+    },
+    {
+      "id": "LAW_059",
+      "count": 2
+    },
+    {
+      "id": "SEC_080",
+      "count": 3
+    },
+    {
+      "id": "LAW_174",
+      "count": 3
+    },
+    {
+      "id": "LAW_057",
+      "count": 1
+    },
+    {
+      "id": "LAW_063",
+      "count": 3
+    },
+    {
+      "id": "LAW_075",
+      "count": 3
+    },
+    {
+      "id": "JTL_089",
+      "count": 3
+    },
+    {
+      "id": "SEC_082",
+      "count": 1
+    },
+    {
+      "id": "LAW_153",
+      "count": 2
+    },
+    {
+      "id": "LAW_168",
+      "count": 2
+    },
+    {
+      "id": "JTL_162",
+      "count": 3
+    },
+    {
+      "id": "LAW_208",
+      "count": 1
+    },
+    {
+      "id": "LAW_173",
+      "count": 3
+    },
+    {
+      "id": "LAW_050",
+      "count": 2
+    },
+    {
+      "id": "SEC_176",
+      "count": 2
+    },
+    {
+      "id": "LAW_134",
+      "count": 3
+    },
+    {
+      "id": "SEC_134",
+      "count": 2
+    }
+  ],
+  "sideboard": [
+    {
+      "id": "SEC_170",
+      "count": 2
+    },
+    {
+      "id": "LAW_042",
+      "count": 1
+    },
+    {
+      "id": "LAW_118",
+      "count": 3
+    },
+    {
+      "id": "LAW_195",
+      "count": 2
+    },
+    {
+      "id": "LAW_191",
+      "count": 2
+    }
+  ]
+},
+  "revan-blue": {
+  "metadata": {
+    "name": "REVAN",
+    "author": "Vayllle"
+  },
+  "leader": {
+    "id": "LOF_017",
+    "count": 1
+  },
+  "base": {
+    "id": "LOF_020",
+    "count": 1
+  },
+  "deck": [
+    {
+      "id": "SEC_035",
+      "count": 2
+    },
+    {
+      "id": "LOF_038",
+      "count": 1
+    },
+    {
+      "id": "JTL_242",
+      "count": 2
+    },
+    {
+      "id": "SEC_244",
+      "count": 2
+    },
+    {
+      "id": "LOF_261",
+      "count": 2
+    },
+    {
+      "id": "LOF_035",
+      "count": 3
+    },
+    {
+      "id": "SEC_078",
+      "count": 1
+    },
+    {
+      "id": "LOF_042",
+      "count": 2
+    },
+    {
+      "id": "LOF_078",
+      "count": 2
+    },
+    {
+      "id": "SEC_038",
+      "count": 1
+    },
+    {
+      "id": "LOF_057",
+      "count": 2
+    },
+    {
+      "id": "LOF_234",
+      "count": 2
+    },
+    {
+      "id": "LOF_067",
+      "count": 3
+    },
+    {
+      "id": "LOF_079",
+      "count": 3
+    },
+    {
+      "id": "SEC_040",
+      "count": 1
+    },
+    {
+      "id": "LOF_231",
+      "count": 3
+    },
+    {
+      "id": "LOF_230",
+      "count": 3
+    },
+    {
+      "id": "JTL_033",
+      "count": 2
+    },
+    {
+      "id": "LOF_229",
+      "count": 2
+    },
+    {
+      "id": "LOF_031",
+      "count": 3
+    },
+    {
+      "id": "LOF_061",
+      "count": 3
+    },
+    {
+      "id": "LOF_237",
+      "count": 1
+    },
+    {
+      "id": "LOF_074",
+      "count": 3
+    },
+    {
+      "id": "SEC_070",
+      "count": 3
+    }
+  ],
+  "sideboard": [
+    {
+      "id": "LOF_034",
+      "count": 2
+    },
+    {
+      "id": "SEC_069",
+      "count": 2
+    },
+    {
+      "id": "LOF_069",
+      "count": 2
+    },
+    {
+      "id": "LAW_118",
+      "count": 2
+    },
+    {
+      "id": "SOR_074",
+      "count": 2
+    }
+  ]
+},
+  "vador-blue-force": {
+  "metadata": {
+    "name": "vador pew pew - force",
+    "author": "Vayllle"
+  },
+  "leader": {
+    "id": "LAW_011",
+    "count": 1
+  },
+  "base": {
+    "id": "LOF_020",
+    "count": 1
+  },
+  "deck": [
+    {
+      "id": "LAW_052",
+      "count": 3
+    },
+    {
+      "id": "LOF_036",
+      "count": 2
+    },
+    {
+      "id": "LAW_048",
+      "count": 3
+    },
+    {
+      "id": "LAW_174",
+      "count": 3
+    },
+    {
+      "id": "JTL_175",
+      "count": 2
+    },
+    {
+      "id": "LOF_067",
+      "count": 3
+    },
+    {
+      "id": "LOF_160",
+      "count": 3
+    },
+    {
+      "id": "LOF_035",
+      "count": 2
+    },
+    {
+      "id": "LAW_206",
+      "count": 3
+    },
+    {
+      "id": "LOF_148",
+      "count": 2
+    },
+    {
+      "id": "LOF_079",
+      "count": 2
+    },
+    {
+      "id": "SEC_179",
+      "count": 2
+    },
+    {
+      "id": "LOF_059",
+      "count": 3
+    },
+    {
+      "id": "LOF_175",
+      "count": 2
+    },
+    {
+      "id": "LAW_051",
+      "count": 2
+    },
+    {
+      "id": "LOF_070",
+      "count": 2
+    },
+    {
+      "id": "JTL_153",
+      "count": 2
+    },
+    {
+      "id": "LOF_231",
+      "count": 2
+    },
+    {
+      "id": "LOF_031",
+      "count": 3
+    },
+    {
+      "id": "LOF_165",
+      "count": 2
+    },
+    {
+      "id": "SEC_244",
+      "count": 2
+    },
+    {
+      "id": "LOF_057",
+      "count": 2
+    }
+  ],
+  "sideboard": [
+    {
+      "id": "JTL_144",
+      "count": 2
+    },
+    {
+      "id": "LAW_200",
+      "count": 2
+    },
+    {
+      "id": "LAW_179",
+      "count": 2
+    },
+    {
+      "id": "LAW_044",
+      "count": 2
+    },
+    {
+      "id": "LAW_043",
+      "count": 2
+    }
+  ]
+},
+  "hera-spectre": {
+  "metadata": {
+    "name": "Spectre",
+    "author": "Vayllle"
+  },
+  "leader": {
+    "id": "LAW_009",
+    "count": 1
+  },
+  "base": {
+    "id": "LAW_020",
+    "count": 1
+  },
+  "deck": [
+    {
+      "id": "JTL_250",
+      "count": 3
+    },
+    {
+      "id": "LAW_224",
+      "count": 2
+    },
+    {
+      "id": "LAW_055",
+      "count": 2
+    },
+    {
+      "id": "LAW_144",
+      "count": 3
+    },
+    {
+      "id": "LOF_055",
+      "count": 2
+    },
+    {
+      "id": "LAW_078",
+      "count": 3
+    },
+    {
+      "id": "LAW_069",
+      "count": 2
+    },
+    {
+      "id": "LAW_035",
+      "count": 3
+    },
+    {
+      "id": "LAW_113",
+      "count": 2
+    },
+    {
+      "id": "LAW_168",
+      "count": 3
+    },
+    {
+      "id": "LAW_142",
+      "count": 2
+    },
+    {
+      "id": "JTL_053",
+      "count": 3
+    },
+    {
+      "id": "JTL_045",
+      "count": 3
+    },
+    {
+      "id": "LAW_045",
+      "count": 3
+    },
+    {
+      "id": "LOF_046",
+      "count": 3
+    },
+    {
+      "id": "LAW_089",
+      "count": 3
+    },
+    {
+      "id": "SEC_103",
+      "count": 2
+    },
+    {
+      "id": "LAW_150",
+      "count": 2
+    },
+    {
+      "id": "SEC_094",
+      "count": 2
+    },
+    {
+      "id": "LAW_037",
+      "count": 3
+    }
+  ],
+  "sideboard": [
+    {
+      "id": "LAW_256",
+      "count": 1
+    },
+    {
+      "id": "SEC_078",
+      "count": 2
+    },
+    {
+      "id": "LOF_056",
+      "count": 2
+    }
+  ]
+},
+  "avar-blue": {
+  "metadata": {
+    "name": "FORCE FORCE",
+    "author": "Vayllle"
+  },
+  "leader": {
+    "id": "LOF_007",
+    "count": 1
+  },
+  "base": {
+    "id": "LOF_020",
+    "count": 1
+  },
+  "deck": [
+    {
+      "id": "LOF_094",
+      "count": 3
+    },
+    {
+      "id": "LOF_246",
+      "count": 2
+    },
+    {
+      "id": "LOF_261",
+      "count": 2
+    },
+    {
+      "id": "LOF_045",
+      "count": 3
+    },
+    {
+      "id": "LOF_074",
+      "count": 2
+    },
+    {
+      "id": "LOF_093",
+      "count": 2
+    },
+    {
+      "id": "LOF_078",
+      "count": 2
+    },
+    {
+      "id": "LOF_067",
+      "count": 3
+    },
+    {
+      "id": "LOF_249",
+      "count": 2
+    },
+    {
+      "id": "LOF_051",
+      "count": 2
+    },
+    {
+      "id": "LOF_252",
+      "count": 3
+    },
+    {
+      "id": "LOF_097",
+      "count": 2
+    },
+    {
+      "id": "LOF_115",
+      "count": 3
+    },
+    {
+      "id": "LOF_057",
+      "count": 2
+    },
+    {
+      "id": "LOF_101",
+      "count": 2
+    },
+    {
+      "id": "LAW_149",
+      "count": 1
+    },
+    {
+      "id": "LOF_096",
+      "count": 3
+    },
+    {
+      "id": "LOF_100",
+      "count": 3
+    },
+    {
+      "id": "SEC_078",
+      "count": 2
+    },
+    {
+      "id": "LOF_128",
+      "count": 3
+    },
+    {
+      "id": "LOF_079",
+      "count": 3
+    }
+  ],
+  "sideboard": [
+    {
+      "id": "LOF_104",
+      "count": 2
+    },
+    {
+      "id": "LOF_103",
+      "count": 2
+    },
+    {
+      "id": "SEC_077",
+      "count": 2
+    },
+    {
+      "id": "LAW_035",
+      "count": 3
+    }
+  ]
+},
+  "vador-yellow-force": {
+  "metadata": {
+    "name": "Olive Mad Max",
+    "author": "Vayllle"
+  },
+  "leader": {
+    "id": "LAW_011",
+    "count": 1
+  },
+  "base": {
+    "id": "LOF_030",
+    "count": 1
+  },
+  "deck": [
+    {
+      "id": "LAW_173",
+      "count": 3
+    },
+    {
+      "id": "LOF_130",
+      "count": 2
+    },
+    {
+      "id": "LOF_132",
+      "count": 2
+    },
+    {
+      "id": "SEC_233",
+      "count": 2
+    },
+    {
+      "id": "SEC_188",
+      "count": 2
+    },
+    {
+      "id": "LOF_183",
+      "count": 3
+    },
+    {
+      "id": "LAW_083",
+      "count": 2
+    },
+    {
+      "id": "LOF_185",
+      "count": 2
+    },
+    {
+      "id": "LAW_077",
+      "count": 2
+    },
+    {
+      "id": "LAW_237",
+      "count": 2
+    },
+    {
+      "id": "LOF_189",
+      "count": 2
+    },
+    {
+      "id": "LOF_184",
+      "count": 3
+    },
+    {
+      "id": "SEC_244",
+      "count": 2
+    },
+    {
+      "id": "LAW_211",
+      "count": 3
+    },
+    {
+      "id": "LAW_179",
+      "count": 2
+    },
+    {
+      "id": "LAW_084",
+      "count": 3
+    },
+    {
+      "id": "LAW_075",
+      "count": 3
+    },
+    {
+      "id": "LOF_231",
+      "count": 3
+    },
+    {
+      "id": "LAW_076",
+      "count": 3
+    },
+    {
+      "id": "LAW_206",
+      "count": 3
+    },
+    {
+      "id": "LAW_174",
+      "count": 3
+    }
+  ],
+  "sideboard": []
+},
+  "lamasu-red": {
+  "metadata": {
+    "name": "Obsidian Godzilla",
+    "author": "Vayllle"
+  },
+  "leader": {
+    "id": "SEC_003",
+    "count": 1
+  },
+  "base": {
+    "id": "LAW_025",
+    "count": 1
+  },
+  "deck": [
+    {
+      "id": "LOF_063",
+      "count": 3
+    },
+    {
+      "id": "SEC_244",
+      "count": 2
+    },
+    {
+      "id": "LAW_050",
+      "count": 3
+    },
+    {
+      "id": "SEC_061",
+      "count": 3
+    },
+    {
+      "id": "LAW_087",
+      "count": 2
+    },
+    {
+      "id": "LAW_042",
+      "count": 2
+    },
+    {
+      "id": "LAW_043",
+      "count": 2
+    },
+    {
+      "id": "LAW_051",
+      "count": 2
+    },
+    {
+      "id": "LAW_173",
+      "count": 2
+    },
+    {
+      "id": "JTL_157",
+      "count": 2
+    },
+    {
+      "id": "JTL_033",
+      "count": 3
+    },
+    {
+      "id": "LAW_052",
+      "count": 3
+    },
+    {
+      "id": "SEC_137",
+      "count": 2
+    },
+    {
+      "id": "LOF_153",
+      "count": 2
+    },
+    {
+      "id": "LAW_129",
+      "count": 3
+    },
+    {
+      "id": "LOF_062",
+      "count": 2
+    },
+    {
+      "id": "SEC_069",
+      "count": 3
+    },
+    {
+      "id": "LAW_048",
+      "count": 3
+    },
+    {
+      "id": "SEC_039",
+      "count": 3
+    },
+    {
+      "id": "SEC_029",
+      "count": 3
+    },
+    {
+      "id": "LAW_132",
+      "count": 2
+    },
+    {
+      "id": "SEC_040",
+      "count": 3
+    },
+    {
+      "id": "SEC_176",
+      "count": 3
+    },
+    {
+      "id": "JTL_137",
+      "count": 2
+    },
+    {
+      "id": "LOF_139",
+      "count": 3
+    }
+  ],
+  "sideboard": [
+    {
+      "id": "JTL_056",
+      "count": 2
+    },
+    {
+      "id": "LOF_055",
+      "count": 2
+    }
+  ]
+},
+  "dryden-yellow": {
+  "metadata": {
+    "name": "dryden yellow",
+    "author": "Vayllle"
+  },
+  "leader": {
+    "id": "SEC_007",
+    "count": 1
+  },
+  "base": {
+    "id": "SOR_030",
+    "count": 1
+  },
+  "deck": [
+    {
+      "id": "SEC_218",
+      "count": 3
+    },
+    {
+      "id": "LAW_216",
+      "count": 3
+    },
+    {
+      "id": "LOF_091",
+      "count": 2
+    },
+    {
+      "id": "JTL_216",
+      "count": 3
+    },
+    {
+      "id": "SEC_233",
+      "count": 3
+    },
+    {
+      "id": "LAW_215",
+      "count": 2
+    },
+    {
+      "id": "LAW_074",
+      "count": 3
+    },
+    {
+      "id": "SEC_088",
+      "count": 2
+    },
+    {
+      "id": "LAW_137",
+      "count": 3
+    },
+    {
+      "id": "LOF_179",
+      "count": 3
+    },
+    {
+      "id": "LAW_164",
+      "count": 3
+    },
+    {
+      "id": "LAW_070",
+      "count": 2
+    },
+    {
+      "id": "LAW_159",
+      "count": 3
+    },
+    {
+      "id": "LAW_138",
+      "count": 2
+    },
+    {
+      "id": "JTL_123",
+      "count": 2
+    },
+    {
+      "id": "LAW_214",
+      "count": 2
+    },
+    {
+      "id": "JTL_186",
+      "count": 2
+    },
+    {
+      "id": "LAW_211",
+      "count": 3
+    },
+    {
+      "id": "LAW_134",
+      "count": 2
+    },
+    {
+      "id": "LAW_064",
+      "count": 2
+    }
+  ],
+  "sideboard": []
+},
+  "client-blue": {
+  "metadata": {
+    "name": "Brown Trinity",
+    "author": "Vayllle"
+  },
+  "leader": {
+    "id": "LAW_016",
+    "count": 1
+  },
+  "base": {
+    "id": "LAW_021",
+    "count": 1
+  },
+  "deck": [
+    {
+      "id": "JTL_032",
+      "count": 3
+    },
+    {
+      "id": "LAW_094",
+      "count": 3
+    },
+    {
+      "id": "LAW_043",
+      "count": 3
+    },
+    {
+      "id": "LAW_087",
+      "count": 3
+    },
+    {
+      "id": "JTL_036",
+      "count": 3
+    },
+    {
+      "id": "LAW_211",
+      "count": 3
+    },
+    {
+      "id": "LAW_238",
+      "count": 3
+    },
+    {
+      "id": "JTL_242",
+      "count": 3
+    },
+    {
+      "id": "LAW_118",
+      "count": 3
+    },
+    {
+      "id": "LAW_086",
+      "count": 2
+    },
+    {
+      "id": "LAW_042",
+      "count": 3
+    },
+    {
+      "id": "LAW_093",
+      "count": 3
+    },
+    {
+      "id": "JTL_189",
+      "count": 3
+    },
+    {
+      "id": "JTL_227",
+      "count": 3
+    },
+    {
+      "id": "LOF_183",
+      "count": 3
+    },
+    {
+      "id": "SEC_215",
+      "count": 3
+    },
+    {
+      "id": "SEC_233",
+      "count": 3
+    }
+  ],
+  "sideboard": [
+    {
+      "id": "JTL_056",
+      "count": 2
+    }
+  ]
+},
+  "jyn-red": {
+  "metadata": {
+    "name": "random stuff",
+    "author": "Vayllle"
+  },
+  "leader": {
+    "id": "LAW_005",
+    "count": 1
+  },
+  "base": {
+    "id": "LAW_025",
+    "count": 1
+  },
+  "deck": [
+    {
+      "id": "LAW_051",
+      "count": 2
+    },
+    {
+      "id": "LAW_047",
+      "count": 2
+    },
+    {
+      "id": "LAW_191",
+      "count": 3
+    },
+    {
+      "id": "LAW_133",
+      "count": 2
+    },
+    {
+      "id": "LAW_045",
+      "count": 3
+    },
+    {
+      "id": "LAW_129",
+      "count": 2
+    },
+    {
+      "id": "LAW_185",
+      "count": 1
+    },
+    {
+      "id": "SEC_074",
+      "count": 2
+    },
+    {
+      "id": "LAW_104",
+      "count": 3
+    },
+    {
+      "id": "LAW_052",
+      "count": 3
+    },
+    {
+      "id": "LAW_109",
+      "count": 2
+    },
+    {
+      "id": "JTL_153",
+      "count": 3
+    },
+    {
+      "id": "LAW_035",
+      "count": 2
+    },
+    {
+      "id": "LAW_224",
+      "count": 2
+    },
+    {
+      "id": "LAW_048",
+      "count": 3
+    },
+    {
+      "id": "LAW_105",
+      "count": 3
+    },
+    {
+      "id": "JTL_051",
+      "count": 3
+    },
+    {
+      "id": "SEC_069",
+      "count": 3
+    },
+    {
+      "id": "SEC_052",
+      "count": 3
+    },
+    {
+      "id": "LAW_050",
+      "count": 3
+    },
+    {
+      "id": "SEC_179",
+      "count": 2
+    },
+    {
+      "id": "LOF_148",
+      "count": 3
+    },
+    {
+      "id": "LAW_108",
+      "count": 2
+    }
+  ],
+  "sideboard": [
+    {
+      "id": "LAW_129",
+      "count": 1
+    },
+    {
+      "id": "SEC_163",
+      "count": 2
+    },
+    {
+      "id": "SEC_179",
+      "count": 1
+    },
+    {
+      "id": "SEC_065",
+      "count": 2
+    }
+  ]
+},
+  "kallus-swarm": {
+  "metadata": {
+    "name": "i need some sleep",
+    "author": "Vayllle"
+  },
+  "leader": {
+    "id": "LAW_003",
+    "count": 1
+  },
+  "base": {
+    "id": "JTL_024",
+    "count": 1
+  },
+  "deck": [
+    {
+      "id": "LAW_075",
+      "count": 3
+    },
+    {
+      "id": "JTL_092",
+      "count": 3
+    },
+    {
+      "id": "JTL_087",
+      "count": 3
+    },
+    {
+      "id": "JTL_089",
+      "count": 3
+    },
+    {
+      "id": "SEC_087",
+      "count": 3
+    },
+    {
+      "id": "LAW_063",
+      "count": 2
+    },
+    {
+      "id": "LAW_118",
+      "count": 3
+    },
+    {
+      "id": "SEC_082",
+      "count": 3
+    },
+    {
+      "id": "JTL_082",
+      "count": 3
+    },
+    {
+      "id": "LAW_036",
+      "count": 3
+    },
+    {
+      "id": "LAW_133",
+      "count": 2
+    },
+    {
+      "id": "SEC_110",
+      "count": 3
+    },
+    {
+      "id": "LAW_153",
+      "count": 3
+    },
+    {
+      "id": "LAW_041",
+      "count": 2
+    },
+    {
+      "id": "LAW_079",
+      "count": 2
+    },
+    {
+      "id": "SEC_130",
+      "count": 3
+    },
+    {
+      "id": "LAW_169",
+      "count": 3
+    },
+    {
+      "id": "JTL_106",
+      "count": 2
+    },
+    {
+      "id": "SEC_092",
+      "count": 2
+    },
+    {
+      "id": "JTL_117",
+      "count": 2
+    },
+    {
+      "id": "JTL_122",
+      "count": 2
+    },
+    {
+      "id": "SEC_080",
+      "count": 3
+    },
+    {
+      "id": "SEC_083",
+      "count": 3
+    }
+  ],
+  "sideboard": []
+},
+  "andor-aggro": {
+  "metadata": {
+    "name": "the cook keeps on cooking",
+    "author": "Vayllle"
+  },
+  "leader": {
+    "id": "SEC_012",
+    "count": 1
+  },
+  "base": {
+    "id": "LAW_022",
+    "count": 1
+  },
+  "deck": [
+    {
+      "id": "LAW_063",
+      "count": 3
+    },
+    {
+      "id": "SEC_148",
+      "count": 3
+    },
+    {
+      "id": "SEC_168",
+      "count": 3
+    },
+    {
+      "id": "LAW_145",
+      "count": 2
+    },
+    {
+      "id": "LAW_055",
+      "count": 3
+    },
+    {
+      "id": "LAW_118",
+      "count": 3
+    },
+    {
+      "id": "LAW_059",
+      "count": 3
+    },
+    {
+      "id": "LOF_155",
+      "count": 2
+    },
+    {
+      "id": "SEC_179",
+      "count": 2
+    },
+    {
+      "id": "LAW_079",
+      "count": 3
+    },
+    {
+      "id": "LAW_058",
+      "count": 3
+    },
+    {
+      "id": "JTL_106",
+      "count": 3
+    },
+    {
+      "id": "SEC_110",
+      "count": 3
+    },
+    {
+      "id": "LAW_056",
+      "count": 2
+    },
+    {
+      "id": "SEC_172",
+      "count": 2
+    },
+    {
+      "id": "LAW_142",
+      "count": 2
+    },
+    {
+      "id": "SEC_130",
+      "count": 3
+    },
+    {
+      "id": "SEC_096",
+      "count": 3
+    },
+    {
+      "id": "LAW_150",
+      "count": 2
+    }
+  ],
+  "sideboard": [
+    {
+      "id": "LAW_202",
+      "count": 2
+    },
+    {
+      "id": "SEC_158",
+      "count": 2
+    },
+    {
+      "id": "SEC_155",
+      "count": 2
+    },
+    {
+      "id": "SEC_156",
+      "count": 2
+    },
+    {
+      "id": "SEC_122",
+      "count": 2
+    }
+  ]
+},
+  "piett-red": {
+  "metadata": {
+    "name": "big ships big droids",
+    "author": "Vayllle"
+  },
+  "leader": {
+    "id": "JTL_005",
+    "count": 1
+  },
+  "base": {
+    "id": "LAW_025",
+    "count": 1
+  },
+  "deck": [
+    {
+      "id": "JTL_131",
+      "count": 3
+    },
+    {
+      "id": "LAW_062",
+      "count": 2
+    },
+    {
+      "id": "LAW_178",
+      "count": 3
+    },
+    {
+      "id": "LAW_059",
+      "count": 3
+    },
+    {
+      "id": "LAW_063",
+      "count": 3
+    },
+    {
+      "id": "LAW_173",
+      "count": 2
+    },
+    {
+      "id": "LOF_091",
+      "count": 3
+    },
+    {
+      "id": "SEC_080",
+      "count": 3
+    },
+    {
+      "id": "LAW_159",
+      "count": 3
+    },
+    {
+      "id": "JTL_181",
+      "count": 3
+    },
+    {
+      "id": "JTL_089",
+      "count": 3
+    },
+    {
+      "id": "JTL_118",
+      "count": 3
+    },
+    {
+      "id": "SEC_142",
+      "count": 2
+    },
+    {
+      "id": "LOF_130",
+      "count": 3
+    },
+    {
+      "id": "JTL_227",
+      "count": 2
+    },
+    {
+      "id": "SEC_110",
+      "count": 3
+    },
+    {
+      "id": "LOF_106",
+      "count": 2
+    },
+    {
+      "id": "LOF_169",
+      "count": 3
+    },
+    {
+      "id": "LAW_171",
+      "count": 2
+    },
+    {
+      "id": "SEC_122",
+      "count": 3
+    }
+  ],
+  "sideboard": []
+},
+  "sebulba-aggro": {
+  "metadata": {
+    "name": "VROOM VROOM",
+    "author": "Vayllle"
+  },
+  "leader": {
+    "id": "LAW_012",
+    "count": 1
+  },
+  "base": {
+    "id": "SEC_026",
+    "count": 1
+  },
+  "deck": [
+    {
+      "id": "SEC_133",
+      "count": 1
+    },
+    {
+      "id": "LAW_200",
+      "count": 2
+    },
+    {
+      "id": "LOF_179",
+      "count": 3
+    },
+    {
+      "id": "LAW_172",
+      "count": 2
+    },
+    {
+      "id": "LAW_084",
+      "count": 2
+    },
+    {
+      "id": "LOF_132",
+      "count": 1
+    },
+    {
+      "id": "LAW_206",
+      "count": 3
+    },
+    {
+      "id": "LOF_139",
+      "count": 3
+    },
+    {
+      "id": "LAW_075",
+      "count": 3
+    },
+    {
+      "id": "LAW_176",
+      "count": 3
+    },
+    {
+      "id": "LAW_194",
+      "count": 2
+    },
+    {
+      "id": "SEC_233",
+      "count": 3
+    },
+    {
+      "id": "SEC_224",
+      "count": 3
+    },
+    {
+      "id": "LAW_173",
+      "count": 3
+    },
+    {
+      "id": "LOF_136",
+      "count": 2
+    },
+    {
+      "id": "LAW_174",
+      "count": 3
+    },
+    {
+      "id": "LAW_082",
+      "count": 3
+    },
+    {
+      "id": "LAW_076",
+      "count": 3
+    },
+    {
+      "id": "LOF_186",
+      "count": 3
+    },
+    {
+      "id": "LAW_077",
+      "count": 2
+    }
+  ],
+  "sideboard": [
+    {
+      "id": "LAW_044",
+      "count": 1
+    },
+    {
+      "id": "SEC_163",
+      "count": 3
+    }
+  ]
+},
+  "saw-yellow": {
+  "metadata": {
+    "name": "what is this?",
+    "author": "Vayllle"
+  },
+  "leader": {
+    "id": "LAW_001",
+    "count": 1
+  },
+  "base": {
+    "id": "JTL_030",
+    "count": 1
+  },
+  "deck": [
+    {
+      "id": "LAW_057",
+      "count": 3
+    },
+    {
+      "id": "LAW_082",
+      "count": 2
+    },
+    {
+      "id": "LAW_074",
+      "count": 2
+    },
+    {
+      "id": "SEC_163",
+      "count": 2
+    },
+    {
+      "id": "LAW_058",
+      "count": 3
+    },
+    {
+      "id": "LAW_084",
+      "count": 2
+    },
+    {
+      "id": "LAW_062",
+      "count": 3
+    },
+    {
+      "id": "SEC_170",
+      "count": 3
+    },
+    {
+      "id": "LOF_163",
+      "count": 3
+    },
+    {
+      "id": "LAW_189",
+      "count": 2
+    },
+    {
+      "id": "SEC_221",
+      "count": 3
+    },
+    {
+      "id": "SEC_233",
+      "count": 3
+    },
+    {
+      "id": "LAW_188",
+      "count": 2
+    },
+    {
+      "id": "LAW_168",
+      "count": 2
+    },
+    {
+      "id": "LOF_213",
+      "count": 2
+    },
+    {
+      "id": "LAW_059",
+      "count": 3
+    },
+    {
+      "id": "LOF_161",
+      "count": 2
+    },
+    {
+      "id": "LOF_215",
+      "count": 2
+    },
+    {
+      "id": "JTL_162",
+      "count": 3
+    },
+    {
+      "id": "SEC_176",
+      "count": 2
+    },
+    {
+      "id": "LOF_211",
+      "count": 3
+    }
+  ],
+  "sideboard": [
+    {
+      "id": "SEC_172",
+      "count": 1
+    },
+    {
+      "id": "JTL_176",
+      "count": 2
+    },
+    {
+      "id": "LAW_170",
+      "count": 1
+    },
+    {
+      "id": "LAW_083",
+      "count": 2
+    }
+  ]
+},
+  "krennic-yellow": {
+  "metadata": {
+    "name": "ramp",
+    "author": "Vayllle"
+  },
+  "leader": {
+    "id": "LAW_008",
+    "count": 1
+  },
+  "base": {
+    "id": "SOR_030",
+    "count": 1
+  },
+  "deck": [
+    {
+      "id": "LAW_136",
+      "count": 3
+    },
+    {
+      "id": "LOF_207",
+      "count": 3
+    },
+    {
+      "id": "LAW_072",
+      "count": 3
+    },
+    {
+      "id": "LAW_140",
+      "count": 1
+    },
+    {
+      "id": "LAW_216",
+      "count": 1
+    },
+    {
+      "id": "SEC_244",
+      "count": 2
+    },
+    {
+      "id": "LAW_066",
+      "count": 2
+    },
+    {
+      "id": "LOF_213",
+      "count": 3
+    },
+    {
+      "id": "LAW_159",
+      "count": 3
+    },
+    {
+      "id": "SEC_090",
+      "count": 1
+    },
+    {
+      "id": "LAW_171",
+      "count": 2
+    },
+    {
+      "id": "LOF_088",
+      "count": 1
+    },
+    {
+      "id": "SEC_088",
+      "count": 2
+    },
+    {
+      "id": "LAW_214",
+      "count": 2
+    },
+    {
+      "id": "LOF_091",
+      "count": 3
+    },
+    {
+      "id": "LAW_071",
+      "count": 3
+    },
+    {
+      "id": "LOF_254",
+      "count": 3
+    },
+    {
+      "id": "LAW_134",
+      "count": 3
+    },
+    {
+      "id": "LAW_166",
+      "count": 3
+    },
+    {
+      "id": "SEC_233",
+      "count": 3
+    },
+    {
+      "id": "LAW_247",
+      "count": 3
+    },
+    {
+      "id": "LAW_236",
+      "count": 3
+    }
+  ],
+  "sideboard": []
+},
+  "vader-pilot-yellow": {
+  "metadata": {
+    "name": "Event Results - London SQ Winner Darth Vader Cunning (Set 7)",
+    "author": "ScrubGamesSWU"
+  },
+  "leader": {
+    "id": "JTL_006",
+    "count": 1
+  },
+  "base": {
+    "id": "JTL_030",
+    "count": 1
+  },
+  "deck": [
+    {
+      "id": "JTL_217",
+      "count": 3
+    },
+    {
+      "id": "SEC_082",
+      "count": 2
+    },
+    {
+      "id": "JTL_085",
+      "count": 3
+    },
+    {
+      "id": "JTL_242",
+      "count": 2
+    },
+    {
+      "id": "LAW_211",
+      "count": 3
+    },
+    {
+      "id": "SEC_186",
+      "count": 3
+    },
+    {
+      "id": "JTL_212",
+      "count": 3
+    },
+    {
+      "id": "LAW_135",
+      "count": 2
+    },
+    {
+      "id": "SEC_185",
+      "count": 3
+    },
+    {
+      "id": "LOF_091",
+      "count": 2
+    },
+    {
+      "id": "SEC_233",
+      "count": 2
+    },
+    {
+      "id": "SEC_213",
+      "count": 3
+    },
+    {
+      "id": "LAW_233",
+      "count": 2
+    },
+    {
+      "id": "JTL_115",
+      "count": 3
+    },
+    {
+      "id": "JTL_221",
+      "count": 3
+    },
+    {
+      "id": "SEC_189",
+      "count": 3
+    },
+    {
+      "id": "JTL_081",
+      "count": 3
+    },
+    {
+      "id": "SEC_215",
+      "count": 3
+    },
+    {
+      "id": "LAW_217",
+      "count": 2
+    }
+  ],
+  "sideboard": [
+    {
+      "id": "SEC_082",
+      "count": 1
+    },
+    {
+      "id": "JTL_235",
+      "count": 2
+    },
+    {
+      "id": "JTL_120",
+      "count": 2
+    },
+    {
+      "id": "LOF_091",
+      "count": 1
+    },
+    {
+      "id": "JTL_112",
+      "count": 2
+    },
+    {
+      "id": "JTL_214",
+      "count": 2
+    }
+  ]
+},
+  "maul-blue": {
+  "metadata": {
+    "name": "Event Results - London SQ Day 2 Darth Maul Vigilance (Set 7)",
+    "author": "ScrubGamesSWU"
+  },
+  "leader": {
+    "id": "LOF_009",
+    "count": 1
+  },
+  "base": {
+    "id": "LOF_020",
+    "count": 1
+  },
+  "deck": [
+    {
+      "id": "LOF_132",
+      "count": 2
+    },
+    {
+      "id": "LAW_191",
+      "count": 2
+    },
+    {
+      "id": "LOF_129",
+      "count": 3
+    },
+    {
+      "id": "LOF_160",
+      "count": 3
+    },
+    {
+      "id": "LOF_057",
+      "count": 2
+    },
+    {
+      "id": "LOF_079",
+      "count": 2
+    },
+    {
+      "id": "LOF_061",
+      "count": 3
+    },
+    {
+      "id": "JTL_032",
+      "count": 2
+    },
+    {
+      "id": "JTL_143",
+      "count": 1
+    },
+    {
+      "id": "LOF_067",
+      "count": 2
+    },
+    {
+      "id": "LOF_035",
+      "count": 3
+    },
+    {
+      "id": "LOF_070",
+      "count": 3
+    },
+    {
+      "id": "LOF_237",
+      "count": 2
+    },
+    {
+      "id": "LOF_231",
+      "count": 3
+    },
+    {
+      "id": "SEC_069",
+      "count": 3
+    },
+    {
+      "id": "JTL_144",
+      "count": 3
+    },
+    {
+      "id": "LOF_031",
+      "count": 3
+    },
+    {
+      "id": "JTL_043",
+      "count": 3
+    },
+    {
+      "id": "SEC_028",
+      "count": 2
+    },
+    {
+      "id": "LOF_059",
+      "count": 3
+    }
+  ],
+  "sideboard": [
+    {
+      "id": "LAW_191",
+      "count": 1
+    },
+    {
+      "id": "SEC_170",
+      "count": 2
+    },
+    {
+      "id": "JTL_143",
+      "count": 1
+    },
+    {
+      "id": "SEC_180",
+      "count": 2
+    },
+    {
+      "id": "SEC_144",
+      "count": 2
+    },
+    {
+      "id": "SEC_163",
+      "count": 2
+    }
+  ]
+},
+  "talzin-yellow": {
+  "metadata": {
+    "name": "Event Results - London SQ Day 2 Mother Talzin Cunning (Set 7)",
+    "author": "ScrubGamesSWU"
+  },
+  "leader": {
+    "id": "LOF_002",
+    "count": 1
+  },
+  "base": {
+    "id": "LOF_029",
+    "count": 1
+  },
+  "deck": [
+    {
+      "id": "JTL_032",
+      "count": 3
+    },
+    {
+      "id": "LOF_059",
+      "count": 2
+    },
+    {
+      "id": "LOF_231",
+      "count": 3
+    },
+    {
+      "id": "SEC_037",
+      "count": 1
+    },
+    {
+      "id": "LOF_261",
+      "count": 3
+    },
+    {
+      "id": "LOF_061",
+      "count": 3
+    },
+    {
+      "id": "LOF_070",
+      "count": 3
+    },
+    {
+      "id": "SEC_244",
+      "count": 2
+    },
+    {
+      "id": "SEC_188",
+      "count": 3
+    },
+    {
+      "id": "SEC_028",
+      "count": 3
+    },
+    {
+      "id": "JTL_235",
+      "count": 2
+    },
+    {
+      "id": "LOF_183",
+      "count": 3
+    },
+    {
+      "id": "LOF_035",
+      "count": 3
+    },
+    {
+      "id": "SEC_179",
+      "count": 2
+    },
+    {
+      "id": "LOF_031",
+      "count": 3
+    },
+    {
+      "id": "LOF_079",
+      "count": 2
+    },
+    {
+      "id": "SEC_038",
+      "count": 3
+    },
+    {
+      "id": "LAW_086",
+      "count": 3
+    },
+    {
+      "id": "JTL_043",
+      "count": 3
+    }
+  ],
+  "sideboard": [
+    {
+      "id": "SEC_193",
+      "count": 1
+    },
+    {
+      "id": "SEC_046",
+      "count": 1
+    },
+    {
+      "id": "LOF_213",
+      "count": 3
+    },
+    {
+      "id": "JTL_235",
+      "count": 1
+    },
+    {
+      "id": "LOF_057",
+      "count": 1
+    },
+    {
+      "id": "LAW_132",
+      "count": 3
+    }
+  ]
+},
+  "kanan-red": {
+  "metadata": {
+    "name": "Event Results - London SQ Day 2 Kanan Jarrus Stygeon Spire (Set 7)",
+    "author": "ScrubGamesSWU"
+  },
+  "leader": {
+    "id": "LOF_004",
+    "count": 1
+  },
+  "base": {
+    "id": "LAW_027",
+    "count": 1
+  },
+  "deck": [
+    {
+      "id": "LAW_045",
+      "count": 3
+    },
+    {
+      "id": "SEC_069",
+      "count": 2
+    },
+    {
+      "id": "LAW_048",
+      "count": 3
+    },
+    {
+      "id": "JTL_053",
+      "count": 3
+    },
+    {
+      "id": "LOF_046",
+      "count": 3
+    },
+    {
+      "id": "LAW_089",
+      "count": 3
+    },
+    {
+      "id": "LAW_078",
+      "count": 3
+    },
+    {
+      "id": "JTL_149",
+      "count": 3
+    },
+    {
+      "id": "LAW_202",
+      "count": 2
+    },
+    {
+      "id": "JTL_151",
+      "count": 3
+    },
+    {
+      "id": "SEC_163",
+      "count": 3
+    },
+    {
+      "id": "SEC_256",
+      "count": 3
+    },
+    {
+      "id": "SEC_046",
+      "count": 3
+    },
+    {
+      "id": "SEC_179",
+      "count": 3
+    },
+    {
+      "id": "SEC_176",
+      "count": 2
+    },
+    {
+      "id": "JTL_045",
+      "count": 3
+    },
+    {
+      "id": "LOF_044",
+      "count": 3
+    },
+    {
+      "id": "SEC_148",
+      "count": 3
+    }
+  ],
+  "sideboard": [
+    {
+      "id": "JTL_078",
+      "count": 3
+    },
+    {
+      "id": "LAW_049",
+      "count": 2
+    },
+    {
+      "id": "LAW_132",
+      "count": 2
+    },
+    {
+      "id": "SEC_170",
+      "count": 3
+    }
+  ]
+},
+  "dedra-control": {
+  "metadata": {
+    "name": "Thorrk's Dedra control",
+    "author": "Thorrk"
+  },
+  "leader": {
+    "id": "SEC_010",
+    "count": 1
+  },
+  "base": {
+    "id": "JTL_021",
+    "count": 1
+  },
+  "deck": [
+    {
+      "id": "LAW_044",
+      "count": 3
+    },
+    {
+      "id": "SEC_037",
+      "count": 3
+    },
+    {
+      "id": "SEC_180",
+      "count": 3
+    },
+    {
+      "id": "SEC_038",
+      "count": 3
+    },
+    {
+      "id": "SEC_246",
+      "count": 3
+    },
+    {
+      "id": "LAW_050",
+      "count": 3
+    },
+    {
+      "id": "LAW_217",
+      "count": 2
+    },
+    {
+      "id": "JTL_143",
+      "count": 3
+    },
+    {
+      "id": "LAW_178",
+      "count": 1
+    },
+    {
+      "id": "JTL_043",
+      "count": 3
+    },
+    {
+      "id": "SEC_142",
+      "count": 2
+    },
+    {
+      "id": "LAW_121",
+      "count": 3
+    },
+    {
+      "id": "LAW_049",
+      "count": 2
+    },
+    {
+      "id": "LAW_172",
+      "count": 2
+    },
+    {
+      "id": "SEC_182",
+      "count": 3
+    },
+    {
+      "id": "LAW_097",
+      "count": 3
+    },
+    {
+      "id": "JTL_181",
+      "count": 2
+    },
+    {
+      "id": "LAW_133",
+      "count": 3
+    },
+    {
+      "id": "LAW_042",
+      "count": 2
+    },
+    {
+      "id": "JTL_041",
+      "count": 1
+    }
+  ],
+  "sideboard": [
+    {
+      "id": "SEC_078",
+      "count": 2
+    },
+    {
+      "id": "LAW_217",
+      "count": 1
+    },
+    {
+      "id": "JTL_078",
+      "count": 1
+    },
+    {
+      "id": "JTL_181",
+      "count": 1
+    },
+    {
+      "id": "LAW_118",
+      "count": 2
+    },
+    {
+      "id": "LAW_208",
+      "count": 2
+    },
+    {
+      "id": "JTL_041",
+      "count": 1
+    }
+  ]
+},
+  "boba-lake": {
+  "metadata": {
+    "name": "Boba Lake - Gonk Gang Jack - 6th place London Sector Qualifier",
+    "author": "PineappleSWU"
+  },
+  "leader": {
+    "id": "JTL_009",
+    "count": 1
+  },
+  "base": {
+    "id": "JTL_031",
+    "count": 1
+  },
+  "deck": [
+    {
+      "id": "JTL_162",
+      "count": 3
+    },
+    {
+      "id": "LAW_174",
+      "count": 3
+    },
+    {
+      "id": "JTL_143",
+      "count": 3
+    },
+    {
+      "id": "SEC_172",
+      "count": 3
+    },
+    {
+      "id": "JTL_133",
+      "count": 3
+    },
+    {
+      "id": "JTL_140",
+      "count": 3
+    },
+    {
+      "id": "SEC_182",
+      "count": 2
+    },
+    {
+      "id": "JTL_240",
+      "count": 3
+    },
+    {
+      "id": "SEC_171",
+      "count": 3
+    },
+    {
+      "id": "SEC_179",
+      "count": 3
+    },
+    {
+      "id": "JTL_237",
+      "count": 3
+    },
+    {
+      "id": "JTL_136",
+      "count": 3
+    },
+    {
+      "id": "JTL_181",
+      "count": 2
+    },
+    {
+      "id": "JTL_175",
+      "count": 2
+    },
+    {
+      "id": "LAW_208",
+      "count": 2
+    },
+    {
+      "id": "SEC_183",
+      "count": 3
+    },
+    {
+      "id": "SEC_133",
+      "count": 3
+    },
+    {
+      "id": "LAW_173",
+      "count": 3
+    }
+  ],
+  "sideboard": [
+    {
+      "id": "LAW_191",
+      "count": 2
+    },
+    {
+      "id": "JTL_176",
+      "count": 2
+    },
+    {
+      "id": "SEC_163",
+      "count": 2
+    },
+    {
+      "id": "SEC_170",
+      "count": 3
+    },
+    {
+      "id": "JTL_181",
+      "count": 1
+    }
+  ]
+},
+  "aurra-red": {
+  "metadata": {
+    "name": "[Rotation A-B] Aurra Sing Aggression",
+    "author": "ScrubGamesSWU"
+  },
+  "leader": {
+    "id": "LAW_004",
+    "count": 1
+  },
+  "base": {
+    "id": "SEC_024",
+    "count": 1
+  },
+  "deck": [
+    {
+      "id": "LOF_067",
+      "count": 2
+    },
+    {
+      "id": "JTL_041",
+      "count": 1
+    },
+    {
+      "id": "SEC_078",
+      "count": 1
+    },
+    {
+      "id": "SEC_180",
+      "count": 3
+    },
+    {
+      "id": "SEC_075",
+      "count": 3
+    },
+    {
+      "id": "JTL_181",
+      "count": 3
+    },
+    {
+      "id": "LAW_132",
+      "count": 3
+    },
+    {
+      "id": "JTL_043",
+      "count": 3
+    },
+    {
+      "id": "LAW_044",
+      "count": 3
+    },
+    {
+      "id": "LOF_077",
+      "count": 3
+    },
+    {
+      "id": "LAW_133",
+      "count": 3
+    },
+    {
+      "id": "SEC_038",
+      "count": 3
+    },
+    {
+      "id": "SEC_077",
+      "count": 1
+    },
+    {
+      "id": "SEC_176",
+      "count": 1
+    },
+    {
+      "id": "LOF_079",
+      "count": 2
+    },
+    {
+      "id": "JTL_144",
+      "count": 3
+    },
+    {
+      "id": "JTL_143",
+      "count": 3
+    },
+    {
+      "id": "LAW_178",
+      "count": 2
+    },
+    {
+      "id": "SEC_033",
+      "count": 3
+    },
+    {
+      "id": "LOF_041",
+      "count": 3
+    },
+    {
+      "id": "LAW_101",
+      "count": 2
+    }
+  ],
+  "sideboard": [
+    {
+      "id": "JTL_041",
+      "count": 1
+    },
+    {
+      "id": "SEC_078",
+      "count": 2
+    },
+    {
+      "id": "LAW_208",
+      "count": 2
+    },
+    {
+      "id": "LAW_099",
+      "count": 1
+    },
+    {
+      "id": "JTL_078",
+      "count": 2
+    },
+    {
+      "id": "LAW_217",
+      "count": 2
+    }
+  ]
+},
+  "poe-pilot": {
+  "metadata": {
+    "name": "Poe PQ Winner Essen",
+    "author": "SleepyJoe"
+  },
+  "leader": {
+    "id": "JTL_013",
+    "count": 1
+  },
+  "base": {
+    "id": "JTL_024",
+    "count": 1
+  },
+  "deck": [
+    {
+      "id": "JTL_147",
+      "count": 3
+    },
+    {
+      "id": "JTL_118",
+      "count": 2
+    },
+    {
+      "id": "JTL_095",
+      "count": 3
+    },
+    {
+      "id": "SEC_101",
+      "count": 2
+    },
+    {
+      "id": "JTL_155",
+      "count": 3
+    },
+    {
+      "id": "SEC_148",
+      "count": 3
+    },
+    {
+      "id": "JTL_151",
+      "count": 3
+    },
+    {
+      "id": "JTL_250",
+      "count": 3
+    },
+    {
+      "id": "SEC_161",
+      "count": 1
+    },
+    {
+      "id": "JTL_103",
+      "count": 3
+    },
+    {
+      "id": "LAW_183",
+      "count": 3
+    },
+    {
+      "id": "JTL_145",
+      "count": 2
+    },
+    {
+      "id": "JTL_175",
+      "count": 1
+    },
+    {
+      "id": "LAW_205",
+      "count": 3
+    },
+    {
+      "id": "JTL_179",
+      "count": 1
+    },
+    {
+      "id": "JTL_158",
+      "count": 2
+    },
+    {
+      "id": "JTL_096",
+      "count": 3
+    },
+    {
+      "id": "JTL_104",
+      "count": 3
+    },
+    {
+      "id": "LAW_149",
+      "count": 2
+    },
+    {
+      "id": "SEC_163",
+      "count": 2
+    },
+    {
+      "id": "SEC_256",
+      "count": 2
+    },
+    {
+      "id": "LAW_191",
+      "count": 2
+    },
+    {
+      "id": "SEC_094",
+      "count": 2
+    },
+    {
+      "id": "JTL_125",
+      "count": 3
+    },
+    {
+      "id": "SEC_098",
+      "count": 3
+    }
+  ],
+  "sideboard": [
+    {
+      "id": "JTL_181",
+      "count": 2
+    },
+    {
+      "id": "LAW_254",
+      "count": 2
+    },
+    {
+      "id": "JTL_175",
+      "count": 1
+    },
+    {
+      "id": "SEC_170",
+      "count": 2
+    },
+    {
+      "id": "JTL_154",
+      "count": 2
+    },
+    {
+      "id": "LAW_191",
+      "count": 1
+    }
+  ]
+},
+  "lando-lake": {
+  "metadata": {
+    "name": "Lando Lake Country SECTOR QUALIFIER WINNING LIST by ECL_TylerYork - Copy",
+    "author": "The_Mandalorian"
+  },
+  "leader": {
+    "id": "LAW_018",
+    "count": 1
+  },
+  "base": {
+    "id": "JTL_031",
+    "count": 1
+  },
+  "deck": [
+    {
+      "id": "JTL_221",
+      "count": 2
+    },
+    {
+      "id": "LAW_236",
+      "count": 3
+    },
+    {
+      "id": "LAW_228",
+      "count": 3
+    },
+    {
+      "id": "SEC_207",
+      "count": 2
+    },
+    {
+      "id": "SEC_233",
+      "count": 2
+    },
+    {
+      "id": "LAW_229",
+      "count": 3
+    },
+    {
+      "id": "JTL_203",
+      "count": 3
+    },
+    {
+      "id": "SEC_211",
+      "count": 3
+    },
+    {
+      "id": "SEC_209",
+      "count": 2
+    },
+    {
+      "id": "LAW_246",
+      "count": 3
+    },
+    {
+      "id": "LAW_224",
+      "count": 3
+    },
+    {
+      "id": "SEC_204",
+      "count": 3
+    },
+    {
+      "id": "LOF_192",
+      "count": 3
+    },
+    {
+      "id": "LAW_223",
+      "count": 3
+    },
+    {
+      "id": "SEC_198",
+      "count": 3
+    },
+    {
+      "id": "LOF_200",
+      "count": 3
+    },
+    {
+      "id": "SEC_179",
+      "count": 3
+    },
+    {
+      "id": "IBH_052",
+      "count": 3
+    }
+  ],
+  "sideboard": [
+    {
+      "id": "LAW_219",
+      "count": 2
+    },
+    {
+      "id": "SEC_209",
+      "count": 1
+    },
+    {
+      "id": "JTL_235",
+      "count": 1
+    },
+    {
+      "id": "LAW_221",
+      "count": 2
+    },
+    {
+      "id": "LAW_239",
+      "count": 2
+    },
+    {
+      "id": "LOF_199",
+      "count": 2
+    }
+  ]
+},
+  "obiwan-blue": {
+  "metadata": {
+    "name": "Obi-Wan Vergence - Gonk Gang Lorcan - 5th Place London Sector Qualifier",
+    "author": "PineappleSWU"
+  },
+  "leader": {
+    "id": "LOF_008",
+    "count": 1
+  },
+  "base": {
+    "id": "LOF_019",
+    "count": 1
+  },
+  "deck": [
+    {
+      "id": "SEC_046",
+      "count": 2
+    },
+    {
+      "id": "LOF_070",
+      "count": 2
+    },
+    {
+      "id": "SEC_098",
+      "count": 1
+    },
+    {
+      "id": "LOF_069",
+      "count": 1
+    },
+    {
+      "id": "LOF_045",
+      "count": 3
+    },
+    {
+      "id": "LAW_108",
+      "count": 2
+    },
+    {
+      "id": "SEC_048",
+      "count": 2
+    },
+    {
+      "id": "JTL_053",
+      "count": 1
+    },
+    {
+      "id": "LOF_111",
+      "count": 2
+    },
+    {
+      "id": "SEC_094",
+      "count": 1
+    },
+    {
+      "id": "LOF_046",
+      "count": 1
+    },
+    {
+      "id": "SEC_256",
+      "count": 2
+    },
+    {
+      "id": "LOF_100",
+      "count": 3
+    },
+    {
+      "id": "LAW_105",
+      "count": 3
+    },
+    {
+      "id": "LOF_093",
+      "count": 3
+    },
+    {
+      "id": "LOF_053",
+      "count": 2
+    },
+    {
+      "id": "LOF_048",
+      "count": 3
+    },
+    {
+      "id": "JTL_096",
+      "count": 3
+    },
+    {
+      "id": "LOF_096",
+      "count": 3
+    },
+    {
+      "id": "LOF_094",
+      "count": 3
+    },
+    {
+      "id": "LOF_128",
+      "count": 2
+    },
+    {
+      "id": "LOF_261",
+      "count": 3
+    },
+    {
+      "id": "LOF_079",
+      "count": 2
+    },
+    {
+      "id": "LOF_101",
+      "count": 2
+    }
+  ],
+  "sideboard": [
+    {
+      "id": "SEC_046",
+      "count": 1
+    },
+    {
+      "id": "LOF_102",
+      "count": 2
+    },
+    {
+      "id": "LAW_041",
+      "count": 2
+    },
+    {
+      "id": "SEC_047",
+      "count": 1
+    },
+    {
+      "id": "LOF_128",
+      "count": 1
+    },
+    {
+      "id": "LOF_097",
+      "count": 2
+    },
+    {
+      "id": "LOF_079",
+      "count": 1
+    }
+  ]
+},
+  "tobias-red": {
+  "metadata": {
+    "name": "Beckett Red PQ Winner (63 Players)",
+    "author": "StarWarsDad"
+  },
+  "leader": {
+    "id": "LAW_002",
+    "count": 1
+  },
+  "base": {
+    "id": "SEC_024",
+    "count": 1
+  },
+  "deck": [
+    {
+      "id": "SEC_069",
+      "count": 1
+    },
+    {
+      "id": "LAW_191",
+      "count": 1
+    },
+    {
+      "id": "LAW_084",
+      "count": 3
+    },
+    {
+      "id": "LAW_095",
+      "count": 2
+    },
+    {
+      "id": "JTL_235",
+      "count": 2
+    },
+    {
+      "id": "LAW_118",
+      "count": 3
+    },
+    {
+      "id": "LAW_129",
+      "count": 1
+    },
+    {
+      "id": "LAW_092",
+      "count": 2
+    },
+    {
+      "id": "LAW_241",
+      "count": 2
+    },
+    {
+      "id": "LAW_050",
+      "count": 3
+    },
+    {
+      "id": "LAW_090",
+      "count": 3
+    },
+    {
+      "id": "LAW_093",
+      "count": 3
+    },
+    {
+      "id": "LAW_048",
+      "count": 3
+    },
+    {
+      "id": "SEC_163",
+      "count": 2
+    },
+    {
+      "id": "JTL_175",
+      "count": 2
+    },
+    {
+      "id": "JTL_221",
+      "count": 3
+    },
+    {
+      "id": "SEC_179",
+      "count": 3
+    },
+    {
+      "id": "LOF_215",
+      "count": 1
+    },
+    {
+      "id": "LAW_133",
+      "count": 2
+    },
+    {
+      "id": "SEC_176",
+      "count": 2
+    },
+    {
+      "id": "LAW_091",
+      "count": 3
+    },
+    {
+      "id": "SEC_164",
+      "count": 3
+    }
+  ],
+  "sideboard": [
+    {
+      "id": "LAW_191",
+      "count": 2
+    },
+    {
+      "id": "LAW_096",
+      "count": 2
+    },
+    {
+      "id": "JTL_230",
+      "count": 2
+    },
+    {
+      "id": "SEC_078",
+      "count": 3
+    },
+    {
+      "id": "LOF_215",
+      "count": 1
+    }
+  ]
+}
+}
