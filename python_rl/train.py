@@ -309,7 +309,7 @@ def main():
     verbose = not args.quiet
     logger = EpisodeLogger(log_dir=args.log_dir, verbose=verbose)
     env = SWUEnv(server_url=args.server_url, player_id=args.player_id, single_agent_mode=True)
-    policy = TorchPolicy(obs_size=64, action_feature_size=36, lr=args.lr, device=args.device)
+    policy = TorchPolicy(obs_size=64, action_feature_size=40, lr=args.lr, device=args.device)
 
     # Opponent setup — defined here so we can reference the agent's policy
     if args.opponent_policy == "random":
@@ -340,6 +340,11 @@ def main():
     episode_range = range(args.episodes)
     pbar = tqdm(episode_range, desc="Training", disable=not args.quiet, unit="ep")
     actual_wins: list[float] = []
+
+    # Best / worst episode tracking (top-5 by reward margin)
+    best_episodes: list[dict] = []   # sorted best→worst
+    worst_episodes: list[dict] = []  # sorted worst→best
+    MAX_TRACKED = 5
 
     for ep in episode_range:
         episode_number = start_episode + ep + 1
@@ -395,8 +400,8 @@ def main():
             "opp_exhausted_sum": 0.0,
             "opp_base_hp_sum": 0.0,
             "opp_leader_hp_sum": 0.0,
-            "agent_hand_sum": 0,
-            "opp_hand_sum": 0,
+            "agent_hand_sum": 0.0,
+            "opp_hand_sum": 0.0,
             "agent_max_valid_actions": 0,
             "final_phase": None,
             "winner": None,
@@ -406,6 +411,8 @@ def main():
             "regroup_card_action_total": 0,
             "regroup_agent_action_total": 0,
             "regroup_opponent_action_total": 0,
+            "cards_played": 0,
+            "agent_cards_played": 0,
         }
 
         seen_regroup_phase = False
@@ -485,6 +492,22 @@ def main():
                 else:
                     no_action_poll_count = 1
                 last_stall_signature = stall_signature
+            elif valid_actions == 0 and active is None:
+                # Server didn't report an active player — treat as agent stall
+                # if the controlled player has a prompt waiting.
+                agent_key = _player_key_for_id(state_snapshot, args.player_id)
+                agent_prompt = (prompt_snapshot.get(agent_key) if agent_key else None) or {}
+                opp_key = "player2" if agent_key == "player1" else "player1"
+                opp_prompt = prompt_snapshot.get(opp_key, {}) if opp_key else {}
+                if agent_prompt and "waiting for opponent" not in str(agent_prompt.get("menuTitle", "")).lower():
+                    if stall_signature == last_stall_signature:
+                        no_action_poll_count += 1
+                    else:
+                        no_action_poll_count = 1
+                    last_stall_signature = stall_signature
+                else:
+                    no_action_poll_count = 0
+                    last_stall_signature = None
             else:
                 no_action_poll_count = 0
                 last_stall_signature = None
@@ -506,7 +529,7 @@ def main():
             episode_metrics["agent_exhausted_sum"] += agent_board["exhausted_count"]
             episode_metrics["agent_ready_resources_sum"] += agent_board["ready_resources"]
             episode_metrics["agent_credits_sum"] += agent_board["credits"]
-            episode_metrics["agent_hand_sum"] += int(agent_board["hand_count"])
+            episode_metrics["agent_hand_sum"] += agent_board["hand_count"]
             episode_metrics["opp_base_hp_sum"] += opp_board["base_hp"]
             episode_metrics["opp_leader_hp_sum"] += opp_board["leader_hp"]
             episode_metrics["opp_board_power_sum"] += opp_board["board_power"]
@@ -514,7 +537,7 @@ def main():
             episode_metrics["opp_board_damage_sum"] += opp_board["board_damage"]
             episode_metrics["opp_unit_count_sum"] += opp_board["unit_count"]
             episode_metrics["opp_exhausted_sum"] += opp_board["exhausted_count"]
-            episode_metrics["opp_hand_sum"] += int(opp_board["hand_count"])
+            episode_metrics["opp_hand_sum"] += opp_board["hand_count"]
             logger.log(
                 f"[loop] step={step_idx} phase={phase} activePlayer={active} valid_actions={len(env.available_actions)} "
                 f"prompt1={str((prompt_snapshot.get('player1') or {}).get('menuTitle', ''))!r} "
@@ -696,12 +719,22 @@ def main():
                 episode_metrics["total_rewards"] += float(reward)
                 episode_metrics["total_reward_steps"] += 1
                 episode_metrics["agent_rewards"] += float(reward)
+                # Count cards played by the agent (only from hand, not attacks/abilities)
+                action_type = str(chosen_action.get("actionType") or "")
+                if action_type == "clickCard":
+                    card_uuid = chosen_action.get("uuid", "")
+                    # Check if the clicked card is in the agent's hand zone
+                    agent_state = (state_section.get(agent_key) if agent_key else None) or {}
+                    in_hand = any(c.get("uuid") == card_uuid for c in agent_state.get("hand", []))
+                    if in_hand:
+                        episode_metrics["cards_played"] += 1
+                        episode_metrics["agent_cards_played"] += 1
                 if not _is_regroup_phase(phase):
                     current_regroup_action_count += 1
                     current_regroup_agent_action_count += 1
                     current_regroup_rewards += float(reward)
                     current_regroup_steps += 1
-                    if str(chosen_action.get("actionType") or "") in {"clickCard", "macro_resource_cards"}:
+                    if action_type in {"clickCard", "macro_resource_cards"}:
                         current_regroup_card_action_count += 1
                 state_section = (step_info or {}).get("state_dict") or env.current_state or {}
                 logger.record_rl_transition({
@@ -807,7 +840,14 @@ def main():
                     current_regroup_rewards += float(reward)
                     current_regroup_steps += 1
                     if str(opponent_action.get("actionType") if opponent_action else "") in {"clickCard", "macro_resource_cards"}:
-                        current_regroup_card_action_count += 1 
+                        current_regroup_card_action_count += 1
+                # Count opponent cards played (only from hand)
+                if opponent_action and str(opponent_action.get("actionType") or "") == "clickCard":
+                    card_uuid = opponent_action.get("uuid", "")
+                    opp_state = (state_section.get(opp_key) if opp_key else None) or {}
+                    in_hand = any(c.get("uuid") == card_uuid for c in opp_state.get("hand", []))
+                    if in_hand:
+                        episode_metrics["cards_played"] += 1
                 logger.record_rl_transition({
                     "event": "step",
                     "player_id": "opponent",
@@ -835,6 +875,23 @@ def main():
                     episode_metrics["winner"] = winners[0] if len(winners) == 1 else winners
 
         _finalize_regroup_segment(None)
+
+        # Determine actual winner from final board state (base HP = 0 → defeated)
+        final_state = (env.current_state or {}).get("state") or {}
+        agent_key = _player_key_for_id(env.current_state, args.player_id)
+        opp_key = "player2" if agent_key == "player1" else "player1"
+        final_agent = _unit_board_metrics(final_state, agent_key or "player1")
+        final_opp = _unit_board_metrics(final_state, opp_key)
+        agent_base_dead = final_agent["base_hp"] <= 0.0
+        opp_base_dead = final_opp["base_hp"] <= 0.0
+        if agent_base_dead and not opp_base_dead:
+            episode_metrics["winner"] = "opponent"
+        elif opp_base_dead and not agent_base_dead:
+            episode_metrics["winner"] = "agent"
+        elif agent_base_dead and opp_base_dead:
+            episode_metrics["winner"] = "draw"
+        else:
+            episode_metrics["winner"] = "unresolved"
 
         # At episode end, accumulate into batch for periodic REINFORCE update
         if len(rewards) > 0:
@@ -873,45 +930,39 @@ def main():
         summary = {
             **episode_metrics,
             "steps": step_idx,
-            "agent_reward_mean": (episode_metrics["agent_rewards"] / max(1, episode_metrics["agent_turns"])),
-            "opponent_reward_mean": (episode_metrics["opponent_rewards"] / max(1, episode_metrics["opponent_turns"])),
-            "total_reward_mean": (episode_metrics["total_rewards"] / max(1, episode_metrics["total_reward_steps"])),
+            "agent_reward_per_turn": (episode_metrics["agent_rewards"] / max(1, episode_metrics["agent_turns"])),
+            "opponent_reward_per_turn": (episode_metrics["opponent_rewards"] / max(1, episode_metrics["opponent_turns"])),
             "avg_valid_actions": (episode_metrics["valid_actions_sum"] / max(1, episode_metrics["valid_actions_count"])),
             "avg_agent_valid_actions": (episode_metrics["agent_valid_actions_sum"] / max(1, episode_metrics["agent_valid_actions_count"])),
-            "avg_agent_ready_resources": (episode_metrics["agent_ready_resources_sum"] / max(1, episode_metrics["agent_turns"])),
-            "avg_agent_credits": (episode_metrics["agent_credits_sum"] / max(1, episode_metrics["agent_turns"])),
-            "avg_agent_hand": (episode_metrics["agent_hand_sum"] / max(1, episode_metrics["agent_turns"])),
-            "avg_agent_base_hp": (episode_metrics["agent_base_hp_sum"] / max(1, episode_metrics["total_reward_steps"])),
-            "avg_opp_base_hp": (episode_metrics["opp_base_hp_sum"] / max(1, episode_metrics["total_reward_steps"])),
-            "avg_agent_leader_hp": (episode_metrics["agent_leader_hp_sum"] / max(1, episode_metrics["total_reward_steps"])),
-            "avg_opp_leader_hp": (episode_metrics["opp_leader_hp_sum"] / max(1, episode_metrics["total_reward_steps"])),
-            "avg_agent_board_power": (episode_metrics["agent_board_power_sum"] / max(1, episode_metrics["total_reward_steps"])),
-            "avg_opp_board_power": (episode_metrics["opp_board_power_sum"] / max(1, episode_metrics["total_reward_steps"])),
-            "avg_agent_board_hp": (episode_metrics["agent_board_hp_sum"] / max(1, episode_metrics["total_reward_steps"])),
-            "avg_opp_board_hp": (episode_metrics["opp_board_hp_sum"] / max(1, episode_metrics["total_reward_steps"])),
-            "avg_agent_board_damage": (episode_metrics["agent_board_damage_sum"] / max(1, episode_metrics["total_reward_steps"])),
-            "avg_opp_board_damage": (episode_metrics["opp_board_damage_sum"] / max(1, episode_metrics["total_reward_steps"])),
-            "avg_agent_unit_count": (episode_metrics["agent_unit_count_sum"] / max(1, episode_metrics["total_reward_steps"])),
-            "avg_opp_unit_count": (episode_metrics["opp_unit_count_sum"] / max(1, episode_metrics["total_reward_steps"])),
-            "avg_agent_exhausted": (episode_metrics["agent_exhausted_sum"] / max(1, episode_metrics["total_reward_steps"])),
-            "avg_opp_exhausted": (episode_metrics["opp_exhausted_sum"] / max(1, episode_metrics["total_reward_steps"])),
-            "avg_opp_hand": (episode_metrics["opp_hand_sum"] / max(1, episode_metrics["opponent_turns"])),
+            "cards_played_per_turn": (episode_metrics["cards_played"] / max(1, episode_metrics["agent_turns"] + episode_metrics["opponent_turns"])),
         }
 
         reward_margin = summary["agent_rewards"] - summary["opponent_rewards"]
 
+        # Track best / worst episodes by reward margin
+        entry = {
+            "episode": episode_number, "reward_margin": reward_margin,
+            "agent_rewards": summary["agent_rewards"],
+            "opponent_rewards": summary["opponent_rewards"],
+            "steps": summary["steps"], "winner": summary["winner"],
+            "cards_played": summary["cards_played"],
+        }
+        best_episodes.append(entry)
+        best_episodes.sort(key=lambda x: x["reward_margin"], reverse=True)
+        if len(best_episodes) > MAX_TRACKED:
+            best_episodes.pop()
+        worst_episodes.append(entry)
+        worst_episodes.sort(key=lambda x: x["reward_margin"])
+        if len(worst_episodes) > MAX_TRACKED:
+            worst_episodes.pop()
+
         if verbose:
             print(
                 f"[episode {episode_number}] steps={summary['steps']} agent_turns={summary['agent_turns']} "
-                f"opp_turns={summary['opponent_turns']} agent_reward={summary['agent_rewards']:.3f} total_reward={summary['total_rewards']:.3f} "
-                f"avg_valid_actions={summary['avg_valid_actions']:.2f} avg_agent_valid_actions={summary['avg_agent_valid_actions']:.2f} "
-                f"avg_agent_base_hp={summary['avg_agent_base_hp']:.2f} avg_opp_base_hp={summary['avg_opp_base_hp']:.2f} "
-                f"avg_agent_board_power={summary['avg_agent_board_power']:.2f} avg_opp_board_power={summary['avg_opp_board_power']:.2f} "
-                f"avg_agent_board_hp={summary['avg_agent_board_hp']:.2f} avg_opp_board_hp={summary['avg_opp_board_hp']:.2f} "
-                f"avg_agent_board_damage={summary['avg_agent_board_damage']:.2f} avg_opp_board_damage={summary['avg_opp_board_damage']:.2f} "
-                f"avg_agent_unit_count={summary['avg_agent_unit_count']:.2f} avg_opp_unit_count={summary['avg_opp_unit_count']:.2f} "
-                f"regroup_segments={summary['regroup_segment_count']} regroup_actions={summary['regroup_action_total']} "
-                f"regroup_card_actions={summary['regroup_card_action_total']} winner={summary['winner']}"
+                f"opp_turns={summary['opponent_turns']} agent_reward={summary['agent_rewards']:.3f} "
+                f"margin={reward_margin:+.3f} winner={summary['winner']} "
+                f"cards_played={summary['cards_played']} "
+                f"regroup_segments={summary['regroup_segment_count']} regroup_actions={summary['regroup_action_total']}"
             )
         else:
             if not hasattr(pbar, "_rs"):
@@ -942,6 +993,16 @@ def main():
                 latest_payload,
                 f"{args.log_dir}/policy_ep{episode_number}.ckpt",
             )
+
+    # Write best / worst episode tracking to JSON
+    import json as _json
+    _tracking = {
+        "best_episodes_by_margin": best_episodes,
+        "worst_episodes_by_margin": worst_episodes,
+        "total_episodes": start_episode + args.episodes,
+    }
+    with open(os.path.join(args.log_dir, "best_worst_episodes.json"), "w", encoding="utf-8") as _f:
+        _json.dump(_tracking, _f, indent=2, default=str)
 
     logger.close()
 
