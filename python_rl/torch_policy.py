@@ -62,7 +62,7 @@ class TorchPolicy:
     def __init__(
         self,
         obs_size: int = 64,
-        action_feature_size: int = 36,
+        action_feature_size: int = 40,
         lr: float = 1e-3,
         device: str = "cpu",
         action_size: int | None = None,
@@ -89,14 +89,15 @@ class TorchPolicy:
         }.get(action_type, 3)
         features[type_index] = 1.0
 
-        # Structured numeric fields (12 slots)
+        # Structured numeric fields (14 slots)
         structured = action.get("features") or {}
-        # order: is_stateful,is_macro,is_dropdown,is_done,is_card,is_friendly,is_leader,is_base,is_exhausted,is_unit,card_power,card_hp
         struct_vals = [
             float(structured.get("is_stateful", 0.0)),
             float(structured.get("is_macro", 0.0)),
             float(structured.get("is_dropdown", 0.0)),
             float(structured.get("is_done", 0.0)),
+            float(structured.get("is_claim", 0.0)),
+            float(structured.get("is_pass", 0.0)),
             float(structured.get("is_card", 0.0)),
             float(structured.get("is_friendly", 0.0)),
             float(structured.get("is_leader", 0.0)),
@@ -110,7 +111,7 @@ class TorchPolicy:
         offset = 4
         for i, v in enumerate(struct_vals):
             features[offset + i] = v
-        offset += 12
+        offset += 14  # was 12
 
         # A few sparse, stable hash buckets for prompt/card identity.
         prompt_text = str(action.get("promptText", ""))

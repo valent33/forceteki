@@ -104,7 +104,6 @@ class SWUEnv(gym.Env):
                 winners = self.current_state.get("winners", [])
                 if len(winners) > 0:
                     terminated = True
-                    # print(f"[DEBUG] Game Over! Winners: {winners}")
                 elif self.current_state.get("phase") == "game_end":
                     terminated = True
                 else:
@@ -115,8 +114,17 @@ class SWUEnv(gym.Env):
                         title = str(p.get("menuTitle", "")).lower()
                         if "has won" in title or "has won the game" in title:
                             terminated = True
-                            # print(f"[DEBUG] Game Over detected from prompt: {title}")
                             break
+                    # Reliable fallback: base HP <= 0 means the game is over.
+                    if not terminated:
+                        state_section = self.current_state.get("state") or {}
+                        for p_key in ("player1", "player2"):
+                            player = state_section.get(p_key) or {}
+                            base = player.get("base") or {}
+                            hp = float(base.get("hp") or base.get("remainingHp") or base.get("currentHp") or 999)
+                            if hp <= 0:
+                                terminated = True
+                                break
 
                 self._update_available_actions()
 
@@ -230,11 +238,10 @@ class SWUEnv(gym.Env):
             winners = self.current_state.get("winners", [])
             if len(winners) > 0:
                 terminated = True
-                # print(f"[DEBUG] Game Over! Winners: {winners}")
-            elif self.current_state.get("phase") == "game_end": # fallback
+            elif self.current_state.get("phase") == "game_end":
                 terminated = True
             else:
-                # Some builds report the end-of-game via a prompt message instead of winners list.
+                # Some builds report the end-of-game via a prompt message.
                 prompts = self.current_state.get("prompts") or {}
                 for p in prompts.values():
                     if not p:
@@ -242,8 +249,18 @@ class SWUEnv(gym.Env):
                     title = str(p.get("menuTitle", "")).lower()
                     if "has won" in title or "has won the game" in title:
                         terminated = True
-                        # print(f"[DEBUG] Game Over detected from prompt: {title}")
                         break
+
+                # Reliable fallback: if either base is at 0 HP, the game is over.
+                if not terminated:
+                    state_section = self.current_state.get("state") or {}
+                    for p_key in ("player1", "player2"):
+                        player = state_section.get(p_key) or {}
+                        base = player.get("base") or {}
+                        hp = float(base.get("hp") or base.get("remainingHp") or base.get("currentHp") or 999)
+                        if hp <= 0:
+                            terminated = True
+                            break
 
             self._update_available_actions()
 
@@ -288,6 +305,17 @@ class SWUEnv(gym.Env):
 
                 return False
 
+            def _is_stateful_prompt(prompt: dict[str, Any] | None) -> bool:
+                """True if *prompt* has a recognised stateful type OR data key."""
+                if not prompt:
+                    return False
+                ptype = prompt.get("promptType", "")
+                if ptype in {"distributeAmongTargets", "chooseNumber", "chooseAmount", "number"}:
+                    return True
+                if any(k in prompt for k in ("chooseNumber", "chooseAmount", "selectNumber", "distributeAmongTargets")):
+                    return True
+                return False
+
             # In single-agent mode, prefer the prompt for the server-reported active player.
             active_player_id = str(self.current_state.get("activePlayer")) if self.current_state else None
             if active_player_id == str(self.current_state.get("player1Id")):
@@ -297,7 +325,7 @@ class SWUEnv(gym.Env):
                 has_buttons = len(candidate_prompt.get("buttons", [])) > 0
                 has_dropdowns = len(candidate_prompt.get("dropdownListOptions", [])) > 0
                 has_cards = _has_interactive_display_cards(candidate_prompt)
-                if title and "waiting for opponent" not in title.lower() and (has_buttons or has_dropdowns or has_cards):
+                if title and "waiting for opponent" not in title.lower() and (has_buttons or has_dropdowns or has_cards or _is_stateful_prompt(candidate_prompt)):
                     focus_key = candidate_key
             elif active_player_id == str(self.current_state.get("player2Id")):
                 candidate_key = "player2"
@@ -306,10 +334,12 @@ class SWUEnv(gym.Env):
                 has_buttons = len(candidate_prompt.get("buttons", [])) > 0
                 has_dropdowns = len(candidate_prompt.get("dropdownListOptions", [])) > 0
                 has_cards = _has_interactive_display_cards(candidate_prompt)
-                if title and "waiting for opponent" not in title.lower() and (has_buttons or has_dropdowns or has_cards):
+                if title and "waiting for opponent" not in title.lower() and (has_buttons or has_dropdowns or has_cards or _is_stateful_prompt(candidate_prompt)):
                     focus_key = candidate_key
 
-            # If the active player's prompt is not actionable yet, fall back to whichever prompt is actually asking for a decision.
+            # If the active player's prompt is not actionable yet, fall back to whichever
+            # prompt is actually asking for a decision — even if it lacks buttons/cards
+            # but has a recognised stateful prompt type or data key.
             for candidate_key in ("player1", "player2"):
                 if focus_key is not None:
                     break
@@ -319,7 +349,7 @@ class SWUEnv(gym.Env):
                     has_buttons = len(candidate_prompt.get("buttons", [])) > 0
                     has_dropdowns = len(candidate_prompt.get("dropdownListOptions", [])) > 0
                     has_cards = _has_interactive_display_cards(candidate_prompt)
-                    if has_buttons or has_dropdowns or has_cards:
+                    if has_buttons or has_dropdowns or has_cards or _is_stateful_prompt(candidate_prompt):
                         focus_key = candidate_key
                         break
 
@@ -335,6 +365,17 @@ class SWUEnv(gym.Env):
         player_prompt = self.current_state["prompts"].get(p_key)
         menu_title = (player_prompt or {}).get("menuTitle", "")
 
+        # If the focused player is just waiting, see if the OTHER player has an
+        # actionable prompt (e.g. opponent needs to choose a number mid‑turn).
+        if player_prompt and "waiting for opponent" in menu_title.lower():
+            other_key = "player2" if p_key == "player1" else "player1"
+            other_prompt = self.current_state["prompts"].get(other_key)
+            if other_prompt and "waiting for opponent" not in str(other_prompt.get("menuTitle", "")).lower():
+                p_key = other_key
+                p_id = self.current_state.get("player1Id") if p_key == "player1" else self.current_state.get("player2Id")
+                player_prompt = other_prompt
+                menu_title = (player_prompt or {}).get("menuTitle", "")
+
         # Detect prompt change — reset consumed card tracking when the prompt shifts.
         prompt_sig = f"{p_key}:{menu_title}:{player_prompt.get('promptUuid', '')}"
         if prompt_sig != getattr(self, "_last_prompt_sig", None):
@@ -342,6 +383,15 @@ class SWUEnv(gym.Env):
             self._last_prompt_sig = prompt_sig
         if not player_prompt or "Waiting for opponent" in menu_title:
             return
+
+        # ── DEBUG: log when we enter action building with a number prompt ──
+        menu_lower = menu_title.lower()
+        if "choose a number" in menu_lower or "choose number" in menu_lower:
+            import sys as _sys
+            _sys.stderr.write(f"[ENV] number-prompt p_key={p_key} p_id={p_id} "
+                              f"menu={menu_title!r} buttons={len(player_prompt.get('buttons',[]))} "
+                              f"keys={sorted(player_prompt.keys())!r}\n")
+            _sys.stderr.flush()
 
         has_buttons = "buttons" in player_prompt and len(player_prompt["buttons"]) > 0
         has_dropdowns = "dropdownListOptions" in player_prompt and len(player_prompt["dropdownListOptions"]) > 0
@@ -359,12 +409,16 @@ class SWUEnv(gym.Env):
             if has_buttons and not is_stateful_distribution_prompt:
                 for btn in player_prompt["buttons"]:
                     if not btn.get("disabled", False):
+                        btn_arg = str(btn.get("arg", "")).strip().lower()
+                        btn_text = str(btn.get("text", "")).strip().lower()
                         # structured numeric features for the policy
                         features = {
                             "is_stateful": 0.0,
                             "is_macro": 0.0,
                             "is_dropdown": 1.0 if btn.get("command") == "menuButton" else 0.0,
-                            "is_done": 1.0 if str(btn.get("arg", "")).lower() == "done" else 0.0,
+                            "is_done": 1.0 if btn_arg == "done" else 0.0,
+                            "is_claim": 1.0 if ("claim" in btn_arg or "claim" in btn_text) else 0.0,
+                            "is_pass": 1.0 if ("pass" in btn_arg or "pass" in btn_text) else 0.0,
                             "is_card": 0.0,
                             "is_friendly": 0.0,
                             "is_leader": 0.0,
@@ -392,6 +446,8 @@ class SWUEnv(gym.Env):
                         "is_macro": 0.0,
                         "is_dropdown": 1.0,
                         "is_done": 0.0,
+                        "is_claim": 0.0,
+                        "is_pass": 0.0,
                         "is_card": 0.0,
                         "is_friendly": 0.0,
                         "is_leader": 0.0,
@@ -438,6 +494,8 @@ class SWUEnv(gym.Env):
                             "is_macro": 1.0,
                             "is_dropdown": 0.0,
                             "is_done": 0.0,
+                            "is_claim": 0.0,
+                            "is_pass": 0.0,
                             "is_card": 0.0,
                             "is_friendly": 1.0,
                             "is_leader": 0.0,
@@ -465,6 +523,8 @@ class SWUEnv(gym.Env):
                             "is_macro": 1.0,
                             "is_dropdown": 0.0,
                             "is_done": 0.0,
+                            "is_claim": 0.0,
+                            "is_pass": 0.0,
                             "is_card": 0.0,
                             "is_friendly": 1.0,
                             "is_leader": 0.0,
@@ -567,6 +627,8 @@ class SWUEnv(gym.Env):
                             "is_macro": 0.0,
                             "is_dropdown": 0.0,
                             "is_done": 0.0,
+                            "is_claim": 0.0,
+                            "is_pass": 0.0,
                             "is_card": 1.0,
                             "is_friendly": 1.0 if is_friendly else 0.0,
                             "is_leader": 1.0 if is_leader else 0.0,
@@ -610,6 +672,8 @@ class SWUEnv(gym.Env):
                         "is_macro": 0.0,
                         "is_dropdown": 0.0,
                         "is_done": 0.0,
+                        "is_claim": 0.0,
+                        "is_pass": 0.0,
                         "is_card": 1.0,
                         "is_friendly": 0.0,
                         "is_leader": 0.0,
@@ -660,6 +724,101 @@ class SWUEnv(gym.Env):
                     "result": distribution,
                     "promptText": player_prompt.get("menuTitle", ""),
                     "internalName": f"statefulPromptResults {distribution.get('type')}",
+                })
+
+        # ── Last‑resort fallback: no actions built for an active prompt ──
+        if len(self.available_actions) == 0 and player_prompt and "waiting for opponent" not in menu_title.lower():
+            prompt_type = player_prompt.get("promptType", "")
+            menu_lower = menu_title.lower()
+            is_number_prompt = ("choose a number" in menu_lower or
+                                "choose number" in menu_lower or
+                                prompt_type in ("chooseNumber", "chooseAmount", "number") or
+                                any(k in player_prompt for k in ("chooseNumber", "chooseAmount", "selectNumber")))
+
+            # ── ALWAYS dump on number prompts so we can debug ──────
+            if is_number_prompt:
+                try:
+                    import json as _json, os as _os
+                    dump_path = _os.path.join(_os.getcwd(), "prompt_debug.json")
+                    with open(dump_path, "w") as _f:
+                        _json.dump({
+                            "p_key": p_key,
+                            "p_id": p_id,
+                            "menu_title": menu_title,
+                            "prompt_keys": sorted(player_prompt.keys()),
+                            "prompt_type": prompt_type,
+                            "buttons": [{"text": b.get("text",""), "arg": b.get("arg",""),
+                                         "disabled": b.get("disabled", False),
+                                         "command": b.get("command","")}
+                                        for b in player_prompt.get("buttons", [])],
+                            "dropdown_count": len(player_prompt.get("dropdownListOptions", [])),
+                            "selectableCards_count": len(player_prompt.get("selectableCards", [])),
+                            "displayCards_count": len(player_prompt.get("displayCards") or []),
+                            "chooseNumber_data": str(player_prompt.get("chooseNumber", "MISSING"))[:500],
+                            "chooseAmount_data": str(player_prompt.get("chooseAmount", "MISSING"))[:500],
+                        }, _f, indent=2, default=str)
+                except Exception:
+                    pass
+
+            # ── Try every known way to answer a NumberPrompt ────────
+            # 1) statefulPromptResults with the correct data key
+            choose_key = None
+            for k in ("chooseNumber", "chooseAmount", "selectNumber"):
+                if k in player_prompt:
+                    choose_key = k
+                    break
+            if not choose_key and prompt_type in ("chooseNumber", "chooseAmount", "number"):
+                choose_key = prompt_type
+            if choose_key:
+                choose_data = player_prompt.get(choose_key) or {}
+                # NumberPrompt data: { min, max, value } or { minimum, maximum, amount }
+                val = int(choose_data.get("value") or choose_data.get("amount") or
+                          choose_data.get("min") or choose_data.get("minimum") or 0)
+                self.available_actions.append({
+                    "playerId": p_id,
+                    "actionType": "statefulPromptResults",
+                    "uuid": player_prompt.get("promptUuid", ""),
+                    "result": {"type": choose_key, "value": val},
+                    "promptText": menu_title,
+                    "internalName": f"numberPrompt {val}",
+                })
+
+            # 2) Any non‑disabled button (many NumberPrompts have +/-/Done)
+            if len(self.available_actions) == 0:
+                for btn in player_prompt.get("buttons", []):
+                    if not btn.get("disabled", False):
+                        self.available_actions.append({
+                            "playerId": p_id,
+                            "actionType": "clickPrompt",
+                            "arg": btn.get("arg", "done"),
+                            "uuid": btn.get("uuid", player_prompt.get("promptUuid", "")),
+                            "method": btn.get("command", "menuButton"),
+                            "promptText": btn.get("text", "Continue"),
+                        })
+                        break
+
+            # 3) Desperate: ANY button, even disabled
+            if len(self.available_actions) == 0:
+                for btn in player_prompt.get("buttons", []):
+                    self.available_actions.append({
+                        "playerId": p_id,
+                        "actionType": "clickPrompt",
+                        "arg": btn.get("arg", "done"),
+                        "uuid": btn.get("uuid", player_prompt.get("promptUuid", "")),
+                        "method": btn.get("command", "menuButton"),
+                        "promptText": btn.get("text", "Continue"),
+                    })
+                    break
+
+            # 4) Absolute last resort: raw "Done" click with promptUuid
+            if len(self.available_actions) == 0:
+                self.available_actions.append({
+                    "playerId": p_id,
+                    "actionType": "clickPrompt",
+                    "arg": "done",
+                    "uuid": player_prompt.get("promptUuid", ""),
+                    "method": "menuButton",
+                    "promptText": "Done",
                 })
 
 
@@ -1043,10 +1202,7 @@ class SWUEnv(gym.Env):
 
         action_text = str(action_dict.get("promptText", "")).strip().lower()
         action_arg = str(action_dict.get("arg", "")).strip().lower()
-        action_name = str(action_dict.get("actionType", "")).strip().lower()
-        # Substring match: "Claim initiative", "Pass" all trigger
         full_text = f"{action_text} {action_arg}"
-        is_pass_like = any(kw in full_text for kw in ("pass", "claim")) or action_name == "statefulpromptresults"
 
         reward = 0.0
 
@@ -1054,18 +1210,25 @@ class SWUEnv(gym.Env):
         resource_delta = (prev_ready - curr_ready) + 0.5 * (prev_credits - curr_credits)
         reward += 0.04 * resource_delta
 
-        # Penalty for the agent passing with leftover resources OR unexhausted (ready) units.
-        # Only applies when the agent is the one passing, not when the opponent ends their turn.
+        # Small reward for playing a card (any clickCard action) — encourages
+        # the agent to use its hand rather than hoarding cards.
+        # if str(action_dict.get("actionType", "")).lower() == "clickcard":
+        #     reward += 0.05
+
+        # Penalty for the agent passing with leftover resources OR unexhausted units.
+        # Only applies when the agent passes (not when claiming initiative).
         action_player_id = str(action_dict.get("playerId", ""))
         is_agent_action = action_player_id == str(self.player_id)
-        if is_pass_like and is_agent_action:
+        is_claim = "claim" in full_text
+        is_pass = (not is_claim) and ("pass" in full_text)
+
+        if is_agent_action and is_pass:
             # Relative waste: penalty scales with fraction of total capacity left unspent.
-            # e.g. leaving 2/2 is much worse than leaving 2/6.
             prev_exhausted = float(prev_player.get("exhaustedResourceCount") or 0.0)
             total_capacity = prev_ready + prev_exhausted + 0.5 * prev_credits
             wasted = prev_ready + 0.5 * prev_credits
             waste_frac = wasted / max(1.0, total_capacity) if total_capacity > 0 else 0.0
-            if waste_frac > 0.1:  # ignore <10% waste
+            if waste_frac > 0.1:
                 reward -= min(0.8, waste_frac * 1.0)
             # Count unexhausted (ready) units on the agent's board.
             curr_player_state = self._safe_state_player(current_state, curr_key)
@@ -1139,17 +1302,17 @@ class SWUEnv(gym.Env):
             curr_opp_units = self._count_units(curr_opp)
 
             # Opponent base/leader damage — the main path to winning.
-            opp_base_r = 0.25 * max(0.0, prev_opp_base - curr_opp_base)
+            opp_base_r = 0.30 * max(0.0, prev_opp_base - curr_opp_base)
             reward += opp_base_r
 
-            opp_leader_r = 0.15 * max(0.0, prev_opp_leader - curr_opp_leader)
+            opp_leader_r = 0.20 * max(0.0, prev_opp_leader - curr_opp_leader)
             reward += opp_leader_r
 
             # Losing our own base/leader is very bad.
-            my_base_r = -0.25 * max(0.0, prev_my_base - curr_my_base)
+            my_base_r = -0.30 * max(0.0, prev_my_base - curr_my_base)
             reward += my_base_r
 
-            my_leader_r = -0.15 * max(0.0, prev_my_leader - curr_my_leader)
+            my_leader_r = -0.20 * max(0.0, prev_my_leader - curr_my_leader)
             reward += my_leader_r
 
             # Board advantage.
@@ -1161,15 +1324,36 @@ class SWUEnv(gym.Env):
             board_hp_r = 0.015 * board_hp_delta
             reward += board_hp_r
 
-            # Card kills / losses.
-            kill_r = 0.25 * max(0.0, prev_opp_units - curr_opp_units)
+            # Card kills / losses — make unit trading worthwhile.
+            # A typical unit has 3-5 HP; killing it should be comparable to
+            # dealing that much base damage (0.30/HP × 4 = 1.2).
+            kill_r = 1.0 * max(0.0, prev_opp_units - curr_opp_units)
             reward += kill_r
-            loss_r = -0.25 * max(0.0, prev_my_units - curr_my_units)
+            loss_r = -0.5 * max(0.0, prev_my_units - curr_my_units)
             reward += loss_r
 
         winners = current_state.get("winners", []) if current_state else []
         phase = current_state.get("phase") if current_state else None
-        if len(winners) > 0 or phase == "game_end":
+
+        # Terminal reward: use base HP to determine winner (winners list is unreliable).
+        # Recompute current player keys from current_state to avoid scoping issues.
+        term_key = self._state_player_key(current_state)
+        if term_key:
+            term_player = self._safe_state_player(current_state, term_key)
+            term_opp_key = "player2" if term_key == "player1" else "player1"
+            term_opp = self._safe_state_player(current_state, term_opp_key)
+            my_base = self._get_base_hp(term_player)
+            opp_base = self._get_base_hp(term_opp)
+            if opp_base <= 0 and my_base > 0:
+                win_r = 10.0   # agent won
+                reward += win_r
+            elif my_base <= 0 and opp_base > 0:
+                win_r = -10.0  # agent lost
+                reward += win_r
+            elif my_base <= 0 and opp_base <= 0:
+                win_r = 0.0    # simultaneous destruction — draw
+        elif len(winners) > 0 or phase == "game_end":
+            # Fallback if player-key lookup fails but winners list populated
             win_r = 5.0 if str(self.player_id) in {str(w) for w in winners} else -5.0
             reward += win_r
 

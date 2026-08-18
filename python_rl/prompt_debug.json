@@ -1,0 +1,28 @@
+{
+  "p_key": "player1",
+  "p_id": "111",
+  "menu_title": "Choose a number",
+  "prompt_keys": [
+    "buttons",
+    "debug_legalActions",
+    "displayCards",
+    "dropdownListOptions",
+    "menuTitle",
+    "perCardButtons",
+    "playerIsNewlyActive",
+    "promptTitle",
+    "promptType",
+    "promptUuid",
+    "selectNumber",
+    "selectOrder",
+    "selectableCards",
+    "selectedCards"
+  ],
+  "prompt_type": "number",
+  "buttons": [],
+  "dropdown_count": 0,
+  "selectableCards_count": 0,
+  "displayCards_count": 0,
+  "chooseNumber_data": "MISSING",
+  "chooseAmount_data": "MISSING"
+}
