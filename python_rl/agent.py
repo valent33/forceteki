@@ -14,7 +14,7 @@ from urllib.parse import quote_plus
 import requests
 import socketio
 import torch  # type: ignore[import-not-found]
-from swu_env import SWUEnv
+from swu_env import SWUEnv, load_card_database
 from deck_utils import load_deck
 
 
@@ -142,6 +142,315 @@ def print_board_state(state: dict[str, Any] | None) -> None:
         print(f" Hand: {len(p.get('hand', []))} cards")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Board visualizer (--debug_vis)
+# ─────────────────────────────────────────────────────────────────────────────
+_CARD_DB_REF: dict[str, dict[str, Any]] | None = None
+
+
+def _card_def(internal_name: Any) -> dict[str, Any]:
+    """Card-database entry for an internal name (cached card database)."""
+    global _CARD_DB_REF
+    if _CARD_DB_REF is None:
+        try:
+            _CARD_DB_REF = load_card_database()
+        except Exception:
+            _CARD_DB_REF = {}
+    name = str(internal_name or "").strip().lower()
+    if not name:
+        return {}
+    return _CARD_DB_REF.get(name, {})
+
+
+def _num(card: Any, *keys: str, default=None):
+    if not isinstance(card, dict):
+        return default
+    for key in keys:
+        value = card.get(key)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return default
+
+
+def _format_hp(hp, max_hp):
+    if hp is None:
+        return "?"
+    if max_hp is None:
+        return f"{hp:.0f}"
+    return f"{hp:.0f}/{max_hp:.0f}"
+
+
+def _build_rl_view(env) -> dict[str, Any]:
+    """Normalized board view from the RL env-server state format."""
+    state = env.current_state or {}
+    section = state.get("state") or {}
+    player_key = "player1" if str(state.get("player1Id")) == str(env.player_id) else "player2"
+    opp_key = "player2" if player_key == "player1" else "player1"
+
+    def player_view(p_key: str) -> dict[str, Any]:
+        pstate = section.get(p_key) or {}
+        base = pstate.get("base") or {}
+        leader = pstate.get("leader") or {}
+        base_db = _card_def(base.get("internalName"))
+        leader_db = _card_def(leader.get("internalName"))
+        leader_zone = str(leader.get("zone") or "").lower()
+
+        def unit_row(card: dict[str, Any]) -> dict[str, Any]:
+            db = _card_def(card.get("internalName"))
+            upgrades = card.get("upgrades") or []
+            shields = sum(1 for u in upgrades if str(u.get("internalName", "")).lower() == "shield")
+            keywords = {str(k).lower() for k in (db.get("keywords") or [])}
+            hp = _num(card, "hp", "currentHp", default=0.0)
+            max_hp = db.get("hp") if db.get("hp") is not None else hp + (_num(card, "damage", default=0.0))
+            return {
+                "name": str(db.get("title") or card.get("internalName") or "?"),
+                "power": _num(card, "power", "printedPower", default=0.0),
+                "hp": hp,
+                "max_hp": max_hp,
+                "shield": shields,
+                "sentinel": "sentinel" in keywords,
+                "exhausted": bool(card.get("exhausted") or card.get("isExhausted") or card.get("is_exhausted")),
+                "upgrades": [
+                    str(u.get("internalName", "?"))
+                    for u in upgrades
+                    if str(u.get("internalName", "")).lower() != "shield"
+                ],
+            }
+
+        ground = [unit_row(c) for c in (pstate.get("groundArena") or [])]
+        space = [unit_row(c) for c in (pstate.get("spaceArena") or [])]
+        if "ground" in leader_zone:
+            ground.append(unit_row(leader))
+        elif "space" in leader_zone:
+            space.append(unit_row(leader))
+
+        hand_cards = pstate.get("hand") or []
+        return {
+            "name": str(pstate.get("name") or p_key),
+            "base": {
+                "name": str(base_db.get("title") or base.get("internalName") or "?"),
+                "hp": _num(base, "hp", "currentHp", default=0.0),
+                "max_hp": base_db.get("hp") if base_db.get("hp") is not None else None,
+            },
+            "leader_name": str(leader_db.get("title") or leader.get("internalName") or "?"),
+            "leader_deployed": bool("ground" in leader_zone or "space" in leader_zone),
+            "ground": ground,
+            "space": space,
+            "hand": [str(_card_def(c.get("internalName")).get("title") or c.get("internalName") or "?") for c in hand_cards],
+            "hand_hidden": 0,
+            "deck_count": len(pstate.get("deck") or []),
+            "resources_ready": _num(pstate, "readyResourceCount", default=0.0),
+            "resources_total": _num(pstate, "readyResourceCount", default=0.0) + _num(pstate, "exhaustedResourceCount", default=0.0),
+            "credits": _num(pstate, "credits", default=0.0),
+            "force": bool(pstate.get("hasForceToken")),
+        }
+
+    mask = getattr(env, "legal_action_mask", None)
+    legal_total = len(env.available_actions)
+    legal_unmasked = int(mask.sum()) if mask is not None and len(mask) >= legal_total else legal_total
+
+    return {
+        "phase": str(state.get("phase") or "?"),
+        "active_player": "ME" if str(state.get("activePlayer") or "") == str(env.player_id) else "OPP",
+        "friendly": player_view(player_key),
+        "enemy": player_view(opp_key),
+        "legal_total": legal_total,
+        "legal_unmasked": legal_unmasked,
+        "source": "rl",
+    }
+
+
+def _build_gui_view(state: dict[str, Any], player_id: str) -> dict[str, Any]:
+    """Normalized board view from the GUI game-state format (queue mode)."""
+    players = state.get("players") or {}
+    my_state = players.get(player_id)
+    enemy_state = next(
+        (pstate for pid, pstate in players.items() if str(pid) != str(player_id) and isinstance(pstate, dict)),
+        None,
+    )
+
+    def player_view(pstate, is_me: bool) -> dict[str, Any]:
+        empty = {
+            "name": "?",
+            "base": {"name": "?", "hp": 0.0, "max_hp": None},
+            "leader_name": "?",
+            "leader_deployed": False,
+            "ground": [],
+            "space": [],
+            "hand": [],
+            "hand_hidden": 0,
+            "deck_count": 0,
+            "resources_ready": 0.0,
+            "resources_total": None,
+            "credits": 0,
+            "force": False,
+        }
+        if not isinstance(pstate, dict):
+            return empty
+
+        piles = pstate.get("cardPiles") or {}
+
+        def unit_row(card: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "name": str(card.get("name") or "?"),
+                "power": _num(card, "power", default=0.0),
+                "hp": _num(card, "hp", default=0.0),
+                "max_hp": None,
+                "shield": None,
+                "sentinel": bool(card.get("sentinel")),
+                "exhausted": bool(card.get("exhausted")),
+                "upgrades": [],
+            }
+
+        ground = [unit_row(c) for c in (piles.get("groundArena") or []) if isinstance(c, dict)]
+        space = [unit_row(c) for c in (piles.get("spaceArena") or []) if isinstance(c, dict)]
+        leader = pstate.get("leader") or {}
+        leader_zone = str(leader.get("zone") or "").lower()
+        if "ground" in leader_zone:
+            ground.append(unit_row(leader))
+        elif "space" in leader_zone:
+            space.append(unit_row(leader))
+
+        hand_cards = [c for c in (piles.get("hand") or []) if isinstance(c, dict)]
+        hand_names = [str(c.get("name") or "?") for c in hand_cards if c.get("name")]
+        base = pstate.get("base") or {}
+        credits_list = pstate.get("credits") or piles.get("credits") or []
+        force_token = pstate.get("forceToken") or {}
+
+        return {
+            "name": str(pstate.get("name") or ("ME" if is_me else "OPP")),
+            "base": {
+                "name": str(base.get("name") or "?"),
+                "hp": _num(base, "hp", default=0.0),
+                "max_hp": None,
+            },
+            "leader_name": str(leader.get("name") or "?"),
+            "leader_deployed": bool("ground" in leader_zone or "space" in leader_zone),
+            "ground": ground,
+            "space": space,
+            "hand": hand_names,
+            "hand_hidden": max(0, len(hand_cards) - len(hand_names)),
+            "deck_count": int(pstate.get("numCardsInDeck") or 0),
+            "resources_ready": _num(pstate, "availableResources", default=0.0),
+            "resources_total": None,
+            "credits": len(credits_list),
+            "force": bool(force_token.get("active")),
+        }
+
+    prompt_state = (my_state or {}).get("promptState") or {}
+    legal_total = (
+        len(prompt_state.get("buttons") or [])
+        + len(prompt_state.get("dropdownListOptions") or [])
+        + len(prompt_state.get("displayCards") or [])
+        + len(prompt_state.get("perCardButtons") or [])
+    )
+    if isinstance(my_state, dict):
+        piles = my_state.get("cardPiles") or {}
+        for zone_cards in piles.values():
+            if not isinstance(zone_cards, list):
+                continue
+            for card in zone_cards:
+                if isinstance(card, dict) and card.get("selectable"):
+                    legal_total += 1
+        for key in ("leader", "base"):
+            card = my_state.get(key)
+            if isinstance(card, dict) and card.get("selectable"):
+                legal_total += 1
+
+    return {
+        "phase": str(state.get("phase") or "?"),
+        "active_player": "ME" if isinstance(my_state, dict) and my_state.get("isActionPhaseActivePlayer") else "OPP",
+        "friendly": player_view(my_state, True),
+        "enemy": player_view(enemy_state, False),
+        "legal_total": legal_total,
+        "legal_unmasked": legal_total,
+        "source": "gui",
+    }
+
+
+def _render_board_view(view: dict[str, Any]) -> None:
+    friendly = view["friendly"]
+    enemy = view["enemy"]
+    fb, eb = friendly["base"], enemy["base"]
+
+    print("═" * 76)
+    print(f" SWU BOARD  |  Phase: {view['phase']}  |  Active: {view['active_player']}")
+    print(f" Base HP     ME {fb['name']} {_format_hp(fb['hp'], fb['max_hp'])}"
+          f"   |   OPP {eb['name']} {_format_hp(eb['hp'], eb['max_hp'])}")
+    print(f" Leaders     ME {friendly['leader_name']} (deployed={'yes' if friendly['leader_deployed'] else 'no'})"
+          f"   |   OPP {enemy['leader_name']} (deployed={'yes' if enemy['leader_deployed'] else 'no'})")
+
+    def _res_line(side) -> str:
+        ready = side["resources_ready"]
+        total = side["resources_total"]
+        if total is None:
+            return f"{ready:.0f}"
+        return f"{ready:.0f}/{total:.0f}"
+
+    force_holder = "ME" if friendly["force"] else ("OPP" if enemy["force"] else "—")
+    print(f" Resources   ME {_res_line(friendly)}  |  OPP {_res_line(enemy)}"
+          f"      Credits  ME {friendly['credits']:.0f}  OPP {enemy['credits']:.0f}"
+          f"      Force: {force_holder}")
+
+    def _print_arena(title: str, my_units, opp_units) -> None:
+        print(f" {title}:")
+        if not my_units and not opp_units:
+            print("    (empty)")
+            return
+        for owner_label, units in (("ME ", my_units), ("OPP", opp_units)):
+            for unit in units:
+                flags = [f"P {unit['power']:.0f}", f"HP {_format_hp(unit['hp'], unit['max_hp'])}"]
+                if unit.get("shield"):
+                    flags.append(f"shield {unit['shield']}")
+                if unit.get("sentinel"):
+                    flags.append("SENTINEL")
+                if unit.get("exhausted"):
+                    flags.append("exhausted")
+                upgrades = ", ".join(unit.get("upgrades") or [])
+                line = f"    {owner_label} {unit['name']:<30} {' '.join(flags)}"
+                if upgrades:
+                    line += f"  [+{upgrades}]"
+                print(line)
+
+    _print_arena("Ground Arena", friendly["ground"], enemy["ground"])
+    _print_arena("Space Arena", friendly["space"], enemy["space"])
+
+    def _hand_line(side) -> str:
+        if not side["hand"]:
+            return "—"
+        names = side["hand"][:8]
+        return ", ".join(names) + (" …" if len(side["hand"]) > 8 else "")
+
+    enemy_hand_count = len(enemy["hand"]) + enemy["hand_hidden"]
+    enemy_belief = f" ({_hand_line(enemy)})" if enemy["hand"] else ""
+    print(f" Hand        ME [{_hand_line(friendly)}]  |  OPP {enemy_hand_count} cards{enemy_belief}")
+    print(f" Deck        ME {friendly['deck_count']} cards  |  OPP {enemy['deck_count']} cards")
+
+    if view.get("legal_total") is not None:
+        print(f" Legal Actions  total={view['legal_total']}  unmasked={view['legal_unmasked']}")
+    print("═" * 76)
+
+
+def render_rl_board(env) -> None:
+    """Print the --debug_vis board from the RL env-server state."""
+    try:
+        _render_board_view(_build_rl_view(env))
+    except Exception as exc:  # never let the visualizer crash the agent
+        print(f"[debug_vis] render failed: {exc}")
+
+
+def render_gui_board(state: dict[str, Any], player_id: str) -> None:
+    """Print the --debug_vis board from the GUI game state."""
+    try:
+        _render_board_view(_build_gui_view(state, player_id))
+    except Exception as exc:  # never let the visualizer crash the agent
+        print(f"[debug_vis] render failed: {exc}")
+
+
 class QueueBotClient:
     def __init__(
         self,
@@ -155,6 +464,7 @@ class QueueBotClient:
         log_handle=None,
         console_logging: bool = True,
         verbose: bool = False,
+        debug_vis: bool = False,
     ) -> None:
         self.server_url = _normalize_server_url(server_url)
         self.player_id = player_id
@@ -165,6 +475,7 @@ class QueueBotClient:
         self.log_handle = log_handle
         self.console_logging = console_logging
         self.verbose = verbose
+        self.debug_vis = debug_vis
         self.deck_payload = _load_raw_deck(deck_key, decks_file)
         self.socket = socketio.Client(reconnection=True, logger=False, engineio_logger=False)
         self.current_state: dict[str, Any] | None = None
@@ -185,13 +496,27 @@ class QueueBotClient:
                 torch_module = importlib.import_module("torch")
                 torch_policy_module = importlib.import_module("torch_policy")
                 policy_class = getattr(torch_policy_module, "TorchPolicy")
-                # Peek at checkpoint to determine obs_size (may differ from current default)
+                # Derive the architecture from the checkpoint itself so both the
+                # DualHeadNetwork checkpoints (2386-dim) and legacy ones load.
                 ckpt_data = torch_module.load(self.policy_checkpoint, map_location="cpu")
                 state_dict = ckpt_data.get("model_state_dict", ckpt_data)
-                ckpt_obs_size = state_dict.get("obs_encoder.0.weight").shape[1] if "obs_encoder.0.weight" in state_dict else 64
-                self.policy = policy_class(obs_size=ckpt_obs_size, device="cpu")
+                ckpt_obs_size = (
+                    state_dict.get("obs_encoder.0.weight").shape[1]
+                    if "obs_encoder.0.weight" in state_dict
+                    else 2386
+                )
+                ckpt_max_actions = (
+                    state_dict.get("policy_head.weight").shape[0]
+                    if "policy_head.weight" in state_dict
+                    else 100
+                )
+                self.policy = policy_class(
+                    obs_size=ckpt_obs_size,
+                    max_actions=ckpt_max_actions,
+                    device="cpu",
+                )
                 metadata = _load_policy_checkpoint(torch_module, self.policy, self.policy_checkpoint, "cpu")
-                self._log(f"Loaded policy checkpoint from {self.policy_checkpoint}")
+                self._log(f"Loaded policy checkpoint from {self.policy_checkpoint} (obs={ckpt_obs_size}, actions={ckpt_max_actions})")
                 if metadata:
                     self._log(f"Policy checkpoint metadata: {metadata}")
             except ImportError as exc:
@@ -253,6 +578,8 @@ class QueueBotClient:
             phase = game_state.get("phase") if isinstance(game_state, dict) else None
             game_id = game_state.get("id") if isinstance(game_state, dict) else None
             self._log(f"Received gamestate: phase={phase}, game_id={game_id}")
+            if self.debug_vis and isinstance(game_state, dict):
+                render_gui_board(game_state, self.player_id)
             if isinstance(game_state, dict):
                 self._log_game_state(game_state)
             self._maybe_finish_from_game_state(game_state)
@@ -642,7 +969,10 @@ class QueueBotClient:
         return features
 
     def _build_policy_observation(self, state: dict[str, Any], prompt_state: dict[str, Any]) -> list[float]:
-        obs = [0.0] * 64
+        # Zero-pad the queue-mode feature vector to the policy's obs size (legacy
+        # queue features occupy the first 30 slots; SWUEnv-trained checkpoints
+        # expect the full 2386-dim tensor and act approximately randomly here).
+        obs = [0.0] * int(getattr(self.policy, "obs_size", 64) or 64)
         phase = str(state.get("phase") or "unknown")
         prompt_type = str(prompt_state.get("promptType") or "unknown")
         prompt_title = str(prompt_state.get("menuTitle") or prompt_state.get("promptTitle") or "")
@@ -677,17 +1007,14 @@ class QueueBotClient:
         if self.policy is None:
             return random.choice(candidates)
 
+        if len(candidates) > int(getattr(self.policy, "max_actions", 0)):
+            return random.choice(candidates)
+
         obs_tensor = torch.tensor(self._build_policy_observation(state, prompt_state), dtype=torch.float32, device=self.policy.device)
-        obs_batch = obs_tensor.unsqueeze(0).repeat(len(candidates), 1)
-        action_features = torch.tensor(
-            [self.policy.encode_action(candidate) for candidate in candidates],
-            dtype=torch.float32,
-            device=self.policy.device,
-        )
 
         with torch.no_grad():
-            scores = self.policy.net(obs_batch, action_features)
-            action_index = int(torch.argmax(scores).item())
+            logits, _state_value = self.policy.masked_logits(obs_tensor, candidates)
+            action_index = int(torch.argmax(logits).item())
 
         if 0 <= action_index < len(candidates):
             return candidates[action_index]
@@ -901,17 +1228,20 @@ def main():
     parser.add_argument("--decks_file", type=str, default="decks.json", help="JSON file containing the deck dictionaries")
     parser.add_argument("--player_id", type=str, default="111", help="Server player id to control (111 or 222)")
     parser.add_argument("--server_url", type=str, help="Forceteki server URL. Defaults to the GUI server for queue mode and the RL server for --reset.")
-    parser.add_argument("--policy_checkpoint", type=str, default="runs/train_run/policy_latest.ckpt", help="Checkpoint to use for queue-mode policy decisions")
+    parser.add_argument("--policy_checkpoint", type=str, default="runs/train/policy_champion.ckpt", help="Checkpoint to use for policy decisions (champion ckpt or policy_latest.ckpt)")
     parser.add_argument("--reset", action="store_true", help="Initialize the game on the server before playing")
     parser.add_argument("--opponent_deck", type=str, help="Optional opponent deck key when using --reset")
     parser.add_argument("--max_steps", type=int, default=1000, help="Maximum steps to take before stopping")
     parser.add_argument("--poll_delay", type=float, default=0.25, help="Seconds to wait between polls when it is not your turn")
     parser.add_argument("--verbose", action="store_true", help="Print board state and action details every turn")
+    parser.add_argument("--debug_vis", action="store_true", help="Print the clean terminal board visualizer on every state update")
     args = parser.parse_args()
 
     server_url = args.server_url or ("http://localhost:3005" if args.reset else "http://localhost:9500")
 
     if not args.reset:
+        # Human plays through the Forceteki GUI client (queue mode); the bot
+        # takes the other seat automatically once matchmaking pairs them.
         print(f"Connecting to GUI queue server at {server_url} as player {args.player_id} using deck '{args.deck}'")
         bot = QueueBotClient(
             server_url=server_url,
@@ -921,6 +1251,7 @@ def main():
             max_steps=args.max_steps,
             policy_checkpoint=args.policy_checkpoint,
             verbose=args.verbose,
+            debug_vis=args.debug_vis,
         )
         try:
             bot.connect_and_queue()
@@ -967,7 +1298,11 @@ def main():
     if args.policy_checkpoint and os.path.exists(_resolve_relative_path(args.policy_checkpoint)):
         torch_policy_module = importlib.import_module("torch_policy")
         policy_class = getattr(torch_policy_module, "TorchPolicy")
-        policy = policy_class(device="cpu")
+        policy = policy_class(
+            obs_size=env.observation_space.shape[0],
+            max_actions=env.action_space.n,
+            device="cpu",
+        )
         torch_module = importlib.import_module("torch")
         _load_policy_checkpoint(torch_module, policy, _resolve_relative_path(args.policy_checkpoint), "cpu")
 
@@ -987,6 +1322,9 @@ def main():
                     continue
                 raise RuntimeError(f"Unable to refresh server state: {exc}") from exc
 
+            if args.debug_vis:
+                render_rl_board(env)
+
             my_action_indices = [
                 idx for idx, action in enumerate(env.available_actions)
                 if action.get("playerId") == args.player_id
@@ -998,9 +1336,13 @@ def main():
 
             if policy is not None:
                 obs_tensor = torch.tensor(env._get_obs(), dtype=torch.float32)
-                action_index, _ = policy.select_action(obs_tensor, env.available_actions)
+                action_index, _log_prob, state_value = policy.select_action(
+                    obs_tensor, env.available_actions, getattr(env, "legal_action_mask", None)
+                )
                 if action_index is None or action_index not in my_action_indices:
                     action_index = random.choice(my_action_indices)
+                if args.debug_vis and state_value is not None:
+                    print(f"[debug_vis] V(s) = {float(state_value):+.3f}")
             else:
                 action_index = random.choice(my_action_indices)
             action = env.available_actions[action_index]
