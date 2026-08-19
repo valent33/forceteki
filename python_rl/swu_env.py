@@ -1,10 +1,130 @@
+import copy
+import itertools
+import json
+import os
+import re
+import warnings
+from collections import Counter
+from typing import Any
+
 import gymnasium as gym
-from gymnasium import spaces
 import numpy as np
 import requests
-import warnings
-import copy
-from typing import Any
+from gymnasium import spaces
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Star Wars: Unlimited domain dictionaries (Forceteki card data)
+# ─────────────────────────────────────────────────────────────────────────────
+ASPECTS = ["Aggression", "Command", "Cunning", "Vigilance", "Heroism", "Villainy"]
+
+UNIT_TRAITS = [
+    "Armor", "Bounty", "Bounty Hunter", "Capital Ship", "Clone", "Condition", "Creature",
+    "Disaster", "Droid", "Ewok", "Fighter", "First Order", "Force", "Fortification", "Fringe",
+    "Gambit", "Gungan", "Hutt", "Imperial", "Innate", "Inquisitor", "Item", "Jawa", "Jedi",
+    "Kaminoan", "Law", "Learned", "Lightsaber", "Mandalorian", "Modification", "Musician",
+    "Naboo", "New Republic", "Night", "Nihil", "Official", "Pilot", "Plan", "Rebel", "Republic",
+    "Resistance", "Separatist", "Sith", "Spectre", "Speeder", "Supply", "Tactic", "Tank",
+    "Transport", "Trick", "Trooper", "Tusken", "Twi'lek", "Undead", "Underworld", "Vehicle",
+    "Walker", "Weapon", "Wookiee"
+]
+
+BASE_TRAITS = [
+    "Aldhani", "Atollon", "Bracca", "Cantonica", "Castilon", "Christophsis", "Cloud City",
+    "Concordia", "Corellia", "Coruscant", "Dagobah", "Dathomir", "Death Star", "D'Qar", "Eadu",
+    "Endor", "Ferrix", "Geonosis", "Hosnian Prime", "Hoth", "Ilum", "Jedha", "Kalevala",
+    "Kamino", "Kashyyyk", "Kessel", "Lothal", "Lowick", "Malachor", "Mandalore", "Mortis",
+    "Mustafar", "Naboo", "Nadiri", "Narkina 5", "Nevarro", "Oba Diah", "Onderon", "Peridea",
+    "Pillio", "Quarzite", "Ryloth", "Scarif", "Seatos", "Segra Milo", "Serenno", "Sorgan",
+    "Starkiller Base", "Starlight Beacon", "Stygeon Prime", "Takodana", "Tatooine", "Utapau",
+    "Vardos", "Vassek", "Wayland", "Yavin 4", "Zanbar", "Zeffo"
+]
+
+_ASPECT_INDEX: dict[str, int] = {aspect.lower(): i for i, aspect in enumerate(ASPECTS)}
+_UNIT_TRAIT_INDEX: dict[str, int] = {trait.lower(): i for i, trait in enumerate(UNIT_TRAITS)}
+_BASE_TRAIT_INDEX: dict[str, int] = {trait.lower(): i for i, trait in enumerate(BASE_TRAITS)}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# State-tensor geometry (see `_get_obs()` for the exact per-float layout)
+#   Block 1: global / force / economy                    → 14 floats
+#   Block 2: bases & leaders (incl. 59-float multi-hot
+#            BASE_TRAITS vector per base)                → 130 floats
+#   Block 3: friendly hand (10 slots × 12 features)      → 120 floats
+#   Block 4: opponent info-set densities (10 categories) → 10 floats
+#   Block 5: arenas (ground & space, 6 friendly + 6 enemy
+#            slots each, 88 features per slot)           → 2112 floats
+#   TOTAL: OBS_DIM = 2386 floats
+# ─────────────────────────────────────────────────────────────────────────────
+HAND_SLOTS = 10
+HAND_FEATURES = 12
+ARENA_SLOTS_PER_SIDE = 6
+UNIT_SLOT_FEATURES = 88
+
+BLOCK1_SIZE = 14
+BLOCK2_SIZE = 2 * (3 + len(BASE_TRAITS)) + 2 * 3
+BLOCK3_SIZE = HAND_SLOTS * HAND_FEATURES
+BLOCK4_SIZE = 10
+BLOCK5_SIZE = 4 * ARENA_SLOTS_PER_SIDE * UNIT_SLOT_FEATURES
+
+_OBS_B1 = 0
+_OBS_B2 = _OBS_B1 + BLOCK1_SIZE
+_OBS_B3 = _OBS_B2 + BLOCK2_SIZE
+_OBS_B4 = _OBS_B3 + BLOCK3_SIZE
+_OBS_B5 = _OBS_B4 + BLOCK4_SIZE
+OBS_DIM = _OBS_B5 + BLOCK5_SIZE
+
+# Category labels for Block 4 (opponent unseen-threat densities).
+DECK_CATEGORY_LABELS = [
+    "units", "events", "upgrades", "unique units", "space units",
+    "ground units", "removal", "protection", "combat keywords", "cost >= 6",
+]
+
+_CARD_DB: dict[str, dict[str, Any]] | None = None
+
+
+def _card_data_dir() -> str | None:
+    """Locate the Forceteki card-data folder (test/json/Card)."""
+    base = os.path.dirname(os.path.abspath(__file__))
+    for candidate in (
+        os.path.join(base, "..", "test", "json", "Card"),
+        os.path.join(base, "..", "forceteki", "test", "json", "Card"),
+        os.path.join(os.getcwd(), "test", "json", "Card"),
+    ):
+        try:
+            if os.path.isdir(candidate):
+                return os.path.normpath(candidate)
+        except OSError:
+            continue
+    return None
+
+
+def load_card_database(force: bool = False) -> dict[str, dict[str, Any]]:
+    """Load the full card database keyed by `internalName` (cached after first use)."""
+    global _CARD_DB
+    if _CARD_DB is not None and not force:
+        return _CARD_DB
+
+    db: dict[str, dict[str, Any]] = {}
+    card_dir = _card_data_dir()
+    if card_dir:
+        try:
+            for fname in os.listdir(card_dir):
+                if not fname.endswith(".json"):
+                    continue
+                path = os.path.join(card_dir, fname)
+                try:
+                    with open(path, "r", encoding="utf-8") as fh:
+                        payload = json.load(fh)
+                except Exception:
+                    continue
+                entries = payload if isinstance(payload, list) else [payload]
+                for entry in entries:
+                    if isinstance(entry, dict) and entry.get("internalName"):
+                        db[str(entry["internalName"])] = entry
+        except OSError:
+            pass
+    _CARD_DB = db
+    return db
+
 
 class SWUEnv(gym.Env):
     """
@@ -24,18 +144,33 @@ class SWUEnv(gym.Env):
         self.max_action_space = 100
         self.action_space = spaces.Discrete(self.max_action_space)
 
-        # Describe the observation space: 
-        # For simplicity, we flatten the game state into a massive feature Box.
-        # In a deep architecture, this is better represented as Dict of sequences (transformers).
-        self.observation_space = spaces.Box(low=-10.0, high=100.0, shape=(64,), dtype=np.float32)
+        # The observation is a structured, feature-complete State Tensor.
+        # Exact layout is documented in `_get_obs()` and the module-level
+        # block constants (OBS_DIM = 2386 floats).
+        self.observation_space = spaces.Box(
+            low=-10.0, high=100.0, shape=(OBS_DIM,), dtype=np.float32
+        )
 
         self.current_state = None
         self.available_actions = []
         self.active_players = []
+        # Binary mask (length = action space) marking which available actions the
+        # policy is allowed to choose. Built by `_update_available_actions()`.
+        self.legal_action_mask = np.zeros(self.max_action_space, dtype=np.int8)
         # Track card UUIDs already clicked in multi-select prompts so the agent
         # can't keep picking the same cards — exhausts all options, then must click "Done".
         self._consumed_card_uuids: set[str] = set()
         self._last_prompt_key: str | None = None
+        self._last_prompt_sig: str | None = None
+        # Deck definitions (internal names) captured from the /reset payload —
+        # used to build the opponent info-set densities in Block 4.
+        self._deck_definitions: dict[str, Counter] = {"player1": Counter(), "player2": Counter()}
+        # UUID of the unit most recently selected as an attacker; consumed by
+        # the arena / Sentinel legality rules in the action mask.
+        self._pending_attacker_uuid: str | None = None
+        # Most recently clicked card (used to promote a unit to attacker when
+        # the player then presses the "Attack" button).
+        self._last_clicked_card_uuid: str | None = None
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -47,7 +182,10 @@ class SWUEnv(gym.Env):
                 "player1": {"hasInitiative": True}
             }
         }
-        
+
+        # Remember both deck definitions (internal names) before the game starts.
+        self._capture_deck_definitions(payload)
+
         resp = requests.post(f"{self.server_url}/reset", json=payload)
         resp.raise_for_status()
 
@@ -224,6 +362,26 @@ class SWUEnv(gym.Env):
         elif action_dict.get("actionType") == "perCardMenuButton" and action_dict.get("cardUuid"):
             self._consumed_card_uuids.add(str(action_dict["cardUuid"]))
 
+        # Track the attacker for the follow-up "Choose a target for attack" prompt.
+        clicked_uuid = action_dict.get("uuid")
+        if action_dict.get("actionType") in {"clickCard", "displayCardClick"} and clicked_uuid:
+            # Any clicked unit may later be promoted to attacker when the "Attack"
+            # button is pressed, or when the previous prompt was an
+            # "attack with ..." ability that selects the attacker itself.
+            self._last_clicked_card_uuid = str(clicked_uuid)
+            prev_prompts = (prev_state or {}).get("prompts") or {}
+            for seat in ("player1", "player2"):
+                prev_prompt = prev_prompts.get(seat) or {}
+                title = str(prev_prompt.get("menuTitle", "")).lower()
+                if "attack" in title and "with" in title:
+                    self._pending_attacker_uuid = str(clicked_uuid)
+                    break
+        elif action_dict.get("actionType") == "clickPrompt":
+            # Pressing an "Attack" button promotes the most recently clicked unit.
+            action_text = f"{action_dict.get('promptText', '')} {action_dict.get('arg', '')}".lower()
+            if "attack" in action_text and getattr(self, "_last_clicked_card_uuid", None):
+                self._pending_attacker_uuid = self._last_clicked_card_uuid
+
         reward = self._shape_reward(prev_state, self.current_state, action_dict)
         terminated = False
         truncated = False
@@ -268,15 +426,35 @@ class SWUEnv(gym.Env):
 
     def _update_available_actions(self):
         """
-        Translates the current UI prompt / clickable states on the Node.js side 
-        into a flat list of valid actions.
+        Translates the current UI prompt / clickable states on the Node.js side
+        into a flat list of valid actions, and constructs a binary
+        `legal_action_mask` for dynamic action masking.
+
+        Masking rules (applied in `_apply_dynamic_action_masking`):
+          1. Positive stat buffs / shields / friendly upgrades → mask = 0 on
+             enemy targets.
+          2. Damage / negative modifiers / defeat effects → mask = 0 on
+             friendly targets (unless no enemy targets exist or self-sacrifice
+             is forced).
+          3. Arena enforcement: space units cannot attack ground targets and
+             vice versa.
+          4. Sentinel enforcement: if the opponent has a Ready Sentinel unit in
+             an arena, attacks on non-Sentinel targets in that arena are masked
+             unless the attacker has Saboteur.
+
+        Returns
+        -------
+        numpy.ndarray
+            Binary mask of length max_action_space (1 = legal). Also stored on
+            `self.legal_action_mask`.
         """
         self.available_actions = []
         self.active_player = None
         self.active_players = []
-        
+        self.legal_action_mask = np.zeros(self.max_action_space, dtype=np.int8)
+
         if not self.current_state or "prompts" not in self.current_state:
-            return
+            return self.legal_action_mask
 
         def _controlled_prompt_key() -> str | None:
             if not self.current_state:
@@ -381,8 +559,13 @@ class SWUEnv(gym.Env):
         if prompt_sig != getattr(self, "_last_prompt_sig", None):
             self._consumed_card_uuids.clear()
             self._last_prompt_sig = prompt_sig
+
+        # The tracked attacker is only meaningful while an attack prompt is open.
+        if "attack" not in str(menu_title or "").lower():
+            self._pending_attacker_uuid = None
+
         if not player_prompt or "Waiting for opponent" in menu_title:
-            return
+            return self.legal_action_mask
 
         # ── DEBUG: log when we enter action building with a number prompt ──
         menu_lower = menu_title.lower()
@@ -549,20 +732,35 @@ class SWUEnv(gym.Env):
                         
                 # Gather only cards that can legally be selected for this prompt.
                 # Keep opponent zones only for prompts that can target enemy cards.
-                all_cards = {}
+                # Track each card's owner ("me"/"enemy") and zone for the mask.
+                all_cards: dict[str, dict[str, Any]] = {}
+                card_owner: dict[str, str | None] = {}
+                card_zone: dict[str, str | None] = {}
                 for zone in ["hand", "spaceArena", "groundArena"]:
                     for card in my_state.get(zone, []):
                         all_cards[card["uuid"]] = card
+                        card_owner[str(card["uuid"])] = "me"
+                        card_zone[str(card["uuid"])] = self._zone_name(card)
                         for u in card.get("upgrades", []):
                             all_cards[u["uuid"]] = u
+                            card_owner[str(u["uuid"])] = "me"
+                            card_zone[str(u["uuid"])] = self._zone_name(card)
                 if my_state.get("leader"):
                     all_cards[my_state["leader"]["uuid"]] = my_state["leader"]
+                    card_owner[str(my_state["leader"]["uuid"])] = "me"
+                    card_zone[str(my_state["leader"]["uuid"])] = self._zone_name(my_state["leader"])
                     for u in my_state["leader"].get("upgrades", []):
                         all_cards[u["uuid"]] = u
+                        card_owner[str(u["uuid"])] = "me"
+                        card_zone[str(u["uuid"])] = self._zone_name(my_state["leader"])
                 if my_state.get("base"):
                     all_cards[my_state["base"]["uuid"]] = my_state["base"]
+                    card_owner[str(my_state["base"]["uuid"])] = "me"
+                    card_zone[str(my_state["base"]["uuid"])] = "base"
                     for u in my_state["base"].get("upgrades", []):
                         all_cards[u["uuid"]] = u
+                        card_owner[str(u["uuid"])] = "me"
+                        card_zone[str(u["uuid"])] = "base"
 
                 opp_key = "player2" if p_key == "player1" else "player1"
                 if opp_key in self.current_state["state"]:
@@ -570,16 +768,28 @@ class SWUEnv(gym.Env):
                     for zone in ["spaceArena", "groundArena"]:
                         for card in opp_state.get(zone, []):
                             all_cards[card["uuid"]] = card
+                            card_owner[str(card["uuid"])] = "enemy"
+                            card_zone[str(card["uuid"])] = self._zone_name(card)
                             for u in card.get("upgrades", []):
                                 all_cards[u["uuid"]] = u
+                                card_owner[str(u["uuid"])] = "enemy"
+                                card_zone[str(u["uuid"])] = self._zone_name(card)
                     if opp_state.get("leader"):
                         all_cards[opp_state["leader"]["uuid"]] = opp_state["leader"]
+                        card_owner[str(opp_state["leader"]["uuid"])] = "enemy"
+                        card_zone[str(opp_state["leader"]["uuid"])] = self._zone_name(opp_state["leader"])
                         for u in opp_state["leader"].get("upgrades", []):
                             all_cards[u["uuid"]] = u
+                            card_owner[str(u["uuid"])] = "enemy"
+                            card_zone[str(u["uuid"])] = self._zone_name(opp_state["leader"])
                     if opp_state.get("base"):
                         all_cards[opp_state["base"]["uuid"]] = opp_state["base"]
+                        card_owner[str(opp_state["base"]["uuid"])] = "enemy"
+                        card_zone[str(opp_state["base"]["uuid"])] = "base"
                         for u in opp_state["base"].get("upgrades", []):
                             all_cards[u["uuid"]] = u
+                            card_owner[str(u["uuid"])] = "enemy"
+                            card_zone[str(u["uuid"])] = "base"
 
                 # Filter out cards already clicked in this multi-select prompt.
                 filtered_selectable = [u for u in selectable_uuids if u not in self._consumed_card_uuids]
@@ -639,6 +849,19 @@ class SWUEnv(gym.Env):
                             "card_hp": hp_val / 20.0,
                         }
 
+                        # Target legality metadata for the dynamic action mask.
+                        target_owner = card_owner.get(str(uuid))
+                        target_zone = card_zone.get(str(uuid))
+                        target_kws = self._keyword_flags(self._card_data(card.get("internalName")))
+                        meta = {
+                            "targetUuid": str(uuid),
+                            "targetOwner": target_owner,
+                            "targetZone": target_zone,
+                            "targetIsReady": not exhausted_flag,
+                            "targetIsSentinel": bool(target_kws.get("sentinel")),
+                            "targetKeywords": target_kws,
+                        }
+
                         self.available_actions.append({
                             "playerId": p_id,
                             "actionType": "clickCard",
@@ -646,6 +869,7 @@ class SWUEnv(gym.Env):
                             "arg": "any",
                             "internalName": card.get("internalName", "Unknown"),
                             "features": features,
+                            "meta": meta,
                         })
 
                 # Some display-card prompts never populate selectableCards, but the visible cards are still clickable.
@@ -684,6 +908,24 @@ class SWUEnv(gym.Env):
                         "card_hp": hp_val / 20.0,
                     }
 
+                    # Target legality metadata for the dynamic action mask.
+                    d_owner, d_zone = self._locate_card_uuid(str(display_uuid), p_key)
+                    d_kws = self._keyword_flags(
+                        self._card_data(display_card.get("internalName") or resolved_card.get("internalName"))
+                    )
+                    d_exhausted = bool(
+                        resolved_card.get("exhausted") or resolved_card.get("isExhausted")
+                        or resolved_card.get("is_exhausted")
+                    )
+                    d_meta = {
+                        "targetUuid": str(display_uuid),
+                        "targetOwner": d_owner,
+                        "targetZone": d_zone,
+                        "targetIsReady": not d_exhausted,
+                        "targetIsSentinel": bool(d_kws.get("sentinel")),
+                        "targetKeywords": d_kws,
+                    }
+
                     per_card_buttons = player_prompt.get("perCardButtons") or []
                     if per_card_buttons:
                         # DisplayCardsWithButtonsPrompt: each card has buttons (e.g. "Top"/"Bottom").
@@ -701,6 +943,7 @@ class SWUEnv(gym.Env):
                                 "uuid": player_prompt.get("promptUuid", ""),
                                 "internalName": f"{card_name} → {btn_action_label}",
                                 "features": btn_features,
+                                "meta": d_meta,
                             })
                     else:
                         self.available_actions.append({
@@ -711,6 +954,7 @@ class SWUEnv(gym.Env):
                             "promptUuid": player_prompt.get("promptUuid", ""),
                             "internalName": display_card.get("internalName", resolved_card.get("internalName", "Unknown")),
                             "features": features,
+                            "meta": d_meta,
                         })
 
         # Structured distribution prompts need a single synthetic action that carries the server result.
@@ -821,137 +1065,724 @@ class SWUEnv(gym.Env):
                     "promptText": "Done",
                 })
 
+        # ── Dynamic action masking: mark which of these actions the policy may take ──
+        self._apply_dynamic_action_masking(player_prompt, p_key)
+        return self.legal_action_mask
+
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Card database / domain helpers
+    # ──────────────────────────────────────────────────────────────────────────
+    def _card_data(self, internal_name: Any) -> dict[str, Any]:
+        name = str(internal_name or "").strip().lower()
+        if not name:
+            return {}
+        return load_card_database().get(name, {})
+
+    def _capture_deck_definitions(self, payload: Any) -> None:
+        """Record both deck definitions (internal names) from the /reset payload."""
+        self._deck_definitions = {"player1": Counter(), "player2": Counter()}
+        if not isinstance(payload, dict):
+            return
+        for seat_key, field in (("player1", "p1Cards"), ("player2", "p2Cards")):
+            cards = payload.get(field)
+            if isinstance(cards, (list, tuple)):
+                self._deck_definitions[seat_key] = Counter(str(card) for card in cards)
+            elif isinstance(cards, dict):
+                for raw_id, count in cards.items():
+                    try:
+                        self._deck_definitions[seat_key][str(raw_id)] += int(count)
+                    except (TypeError, ValueError):
+                        continue
+
+    def _my_opp_keys(self, state: dict[str, Any] | None) -> tuple[str, str]:
+        if not state:
+            return "player1", "player2"
+        if str(state.get("player1Id")) == str(self.player_id):
+            return "player1", "player2"
+        if str(state.get("player2Id")) == str(self.player_id):
+            return "player2", "player1"
+        return "player1", "player2"
+
+    def _num(self, obj: Any, *keys: str, default: float = 0.0) -> float:
+        if not isinstance(obj, dict):
+            return float(default)
+        for key in keys:
+            value = obj.get(key)
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return float(default)
+
+    def _is_exhausted(self, card: Any) -> bool:
+        if not isinstance(card, dict):
+            return False
+        return bool(card.get("exhausted") or card.get("isExhausted") or card.get("is_exhausted"))
+
+    def _max_hp(self, state_card: Any, db_card: dict[str, Any]) -> float:
+        if db_card.get("hp") is not None:
+            try:
+                return float(db_card["hp"])
+            except (TypeError, ValueError):
+                pass
+        hp = self._num(state_card, "hp", "currentHp")
+        damage = self._num(state_card, "damage")
+        return hp + damage
+
+    def _current_hp(self, state_card: Any, db_card: dict[str, Any]) -> float:
+        hp = self._num(state_card, "hp", "currentHp")
+        if hp > 0.0 or not isinstance(state_card, dict):
+            return hp
+        return max(0.0, self._max_hp(state_card, db_card) - self._num(state_card, "damage"))
+
+    def _zone_name(self, state_card: Any) -> str | None:
+        if not isinstance(state_card, dict):
+            return None
+        zone = str(state_card.get("zone") or "").lower()
+        if "ground" in zone:
+            return "ground"
+        if "space" in zone:
+            return "space"
+        if "hand" in zone:
+            return "hand"
+        if "deck" in zone:
+            return "deck"
+        if "discard" in zone:
+            return "discard"
+        if "resource" in zone:
+            return "resource"
+        if "leader" in zone:
+            return "leader"
+        if "base" in zone:
+            return "base"
+        arena = str(self._card_data(state_card.get("internalName")).get("arena") or "").lower()
+        if arena in ("ground", "space"):
+            return arena
+        return None
+
+    def _aspect_hot(self, aspects: Any) -> np.ndarray:
+        hot = np.zeros(len(ASPECTS), dtype=np.float32)
+        for aspect in aspects or []:
+            index = _ASPECT_INDEX.get(str(aspect).lower())
+            if index is not None:
+                hot[index] = 1.0
+        return hot
+
+    def _trait_hot(self, traits: Any, index_map: dict[str, int], size: int) -> np.ndarray:
+        hot = np.zeros(size, dtype=np.float32)
+        for trait in traits or []:
+            index = index_map.get(str(trait).lower())
+            if index is not None:
+                hot[index] = 1.0
+        return hot
+
+    def _keyword_flags(self, db_card: dict[str, Any]) -> dict[str, Any]:
+        """Combat-keyword flags plus Raid/Restore values parsed from card text."""
+        keywords = {str(k).lower() for k in (db_card.get("keywords") or [])}
+        text = f"{db_card.get('text') or ''} {db_card.get('deployBox') or ''}".lower()
+        flags: dict[str, Any] = {
+            "sentinel": "sentinel" in keywords,
+            "saboteur": "saboteur" in keywords,
+            "grit": "grit" in keywords,
+            "overwhelm": "overwhelm" in keywords,
+            "ambush": "ambush" in keywords,
+            "hidden": ("hidden" in keywords) or ("stealth" in keywords),
+            "raid": 0.0,
+            "restore": 0.0,
+        }
+        match = re.search(r"raid\s*(\d+)", text)
+        flags["raid"] = float(int(match.group(1))) if match else (1.0 if "raid" in keywords else 0.0)
+        match = re.search(r"restore\s*(\d+)", text)
+        flags["restore"] = float(int(match.group(1))) if match else (1.0 if "restore" in keywords else 0.0)
+        return flags
+
+    def _card_type_scalar(self, db_card: dict[str, Any]) -> float:
+        types = {str(t).lower() for t in (db_card.get("types") or [])}
+        if "unit" in types:
+            return 1.0
+        if "event" in types:
+            return 2.0
+        if "upgrade" in types:
+            return 3.0
+        return 0.0
+
+    def _locate_card_uuid(self, uuid: str, my_key: str) -> tuple[str | None, str | None]:
+        """Return (owner, zone) for a card uuid on the current board, if present."""
+        state_section = (self.current_state or {}).get("state") or {}
+        opp_key = "player2" if my_key == "player1" else "player1"
+        for owner, seat in (("me", my_key), ("enemy", opp_key)):
+            player_state = state_section.get(seat) or {}
+            for zone_key in ("hand", "spaceArena", "groundArena"):
+                for card in player_state.get(zone_key) or []:
+                    if str(card.get("uuid")) == uuid:
+                        return owner, self._zone_name(card)
+                    for upgrade in card.get("upgrades") or []:
+                        if str(upgrade.get("uuid")) == uuid:
+                            return owner, self._zone_name(card)
+            for special in ("leader", "base"):
+                card = player_state.get(special)
+                if isinstance(card, dict) and str(card.get("uuid")) == uuid:
+                    return owner, self._zone_name(card)
+                for upgrade in (card or {}).get("upgrades") or []:
+                    if str(upgrade.get("uuid")) == uuid:
+                        return owner, self._zone_name(card)
+        return None, None
+
+    def _debug_playable_map(self, state: dict[str, Any]) -> dict[str, bool]:
+        """Playable status per hand card from the server's debug_legalActions."""
+        playable: dict[str, bool] = {}
+        for seat in ("player1", "player2"):
+            prompt = (state.get("prompts") or {}).get(seat) or {}
+            for entry in prompt.get("debug_legalActions") or []:
+                if not isinstance(entry, dict):
+                    continue
+                can_play = any(
+                    bool(action.get("req")) and bool(action.get("isPlay"))
+                    for action in entry.get("actions") or [] if isinstance(action, dict)
+                )
+                playable[str(entry.get("id") or "").strip().lower()] = can_play
+        return playable
+
+    def _classify_deck_card(self, db_card: dict[str, Any]) -> tuple[int, ...]:
+        """Map a card definition to Block-4 threat category indices."""
+        if not db_card:
+            return ()
+        types = {str(t).lower() for t in (db_card.get("types") or [])}
+        text = str(db_card.get("text") or "").lower()
+        keywords = {str(k).lower() for k in (db_card.get("keywords") or [])}
+        arena = str(db_card.get("arena") or "").lower()
+        categories: list[int] = []
+        if "unit" in types:
+            categories.append(0)
+        if "event" in types:
+            categories.append(1)
+        if "upgrade" in types:
+            categories.append(2)
+        if "unit" in types and db_card.get("unique"):
+            categories.append(3)
+        if "unit" in types and arena == "space":
+            categories.append(4)
+        if "unit" in types and arena == "ground":
+            categories.append(5)
+        if re.search(r"damage|defeat|destroy", text):
+            categories.append(6)
+        if re.search(r"shield|restore|heal", text):
+            categories.append(7)
+        if keywords & {"ambush", "sentinel", "saboteur", "grit", "overwhelm", "raid"}:
+            categories.append(8)
+        if (db_card.get("cost") or 0) >= 6:
+            categories.append(9)
+        return tuple(categories)
+
+    def _opponent_deck_densities(self, opp_key: str, opp_state: dict[str, Any]) -> np.ndarray:
+        """Block 4: (deck definition - discard pile) / remaining deck, per category."""
+        densities = np.zeros(BLOCK4_SIZE, dtype=np.float32)
+        definition = self._deck_definitions.get(opp_key) or Counter()
+        remaining = max(1, len(opp_state.get("deck") or []))
+        def_count = [0.0] * BLOCK4_SIZE
+        discard_count = [0.0] * BLOCK4_SIZE
+        if definition:
+            for name, count in definition.items():
+                for category in self._classify_deck_card(self._card_data(name)):
+                    def_count[category] += float(count)
+        for card in opp_state.get("discard") or []:
+            for category in self._classify_deck_card(self._card_data(card.get("internalName"))):
+                discard_count[category] += 1.0
+        for category in range(BLOCK4_SIZE):
+            if definition:
+                density = max(0.0, def_count[category] - discard_count[category]) / float(remaining)
+            else:
+                # No deck definition available: fall back to discard-pile composition.
+                density = discard_count[category] / float(remaining)
+            densities[category] = min(1.0, density)
+        return densities
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Dynamic action-masking helpers
+    # ──────────────────────────────────────────────────────────────────────────
+    CARD_ACTION_TYPES = ("clickCard", "displayCardClick", "perCardMenuButton", "macro_resource_cards")
+
+    def _classify_prompt_intent(self, player_prompt: dict[str, Any] | None) -> dict[str, bool]:
+        """Heuristically classify what the current prompt is asking for."""
+        title = str((player_prompt or {}).get("menuTitle") or "").lower()
+        prompt_type = str((player_prompt or {}).get("promptType") or "").lower()
+
+        intent = {
+            "is_attack": False,
+            "is_attack_with": False,   # selecting the attacker itself
+            "is_damage": False,
+            "is_defeat": False,
+            "is_shield": False,
+            "is_upgrade": False,
+            "is_buff": False,
+            "is_negative": False,
+            "is_positive": False,
+        }
+        if "attack" in title:
+            intent["is_attack"] = True
+            intent["is_attack_with"] = "with" in title
+        if prompt_type == "distributeamongtargets" or "damage" in title or "deal" in title:
+            intent["is_damage"] = True
+        if "defeat" in title or "destroy" in title:
+            intent["is_defeat"] = True
+        if "shield" in title:
+            intent["is_shield"] = True
+        if "attach" in title and "upgrade" in title:
+            intent["is_upgrade"] = True
+        if (re.search(r"\+[0-9]", title) or "increase" in title or "gain" in title
+                or "restore" in title or "heal" in title):
+            intent["is_buff"] = True
+        # Negative-modifier prompts ("-2/-2") must not be classified as buffs.
+        if intent["is_damage"] or intent["is_defeat"] or re.search(r"-\d", title):
+            intent["is_buff"] = False
+        if any(token in title for token in ("return to hand", "discard", "to exhaust", "capture", "take control")):
+            intent["is_negative"] = True
+        intent["is_negative"] = intent["is_negative"] or intent["is_damage"] or intent["is_defeat"]
+        intent["is_positive"] = intent["is_shield"] or intent["is_upgrade"] or intent["is_buff"]
+        return intent
+
+    def _find_card_in_play(self, uuid: str) -> dict[str, Any] | None:
+        state_section = (self.current_state or {}).get("state") or {}
+        for seat in ("player1", "player2"):
+            player_state = state_section.get(seat) or {}
+            for zone_key in ("spaceArena", "groundArena", "hand"):
+                for card in player_state.get(zone_key) or []:
+                    if str(card.get("uuid")) == uuid:
+                        return card
+            for special in ("leader", "base"):
+                card = player_state.get(special)
+                if isinstance(card, dict) and str(card.get("uuid")) == uuid:
+                    return card
+        return None
+
+    def _resolve_attacker(self, player_prompt: dict[str, Any] | None, p_key: str) -> dict[str, Any] | None:
+        """Find the unit making the attack for an attack-target prompt."""
+        if self._pending_attacker_uuid:
+            card = self._find_card_in_play(self._pending_attacker_uuid)
+            if isinstance(card, dict):
+                return card
+        title = str((player_prompt or {}).get("menuTitle") or "").lower()
+        state_section = (self.current_state or {}).get("state") or {}
+        my_state = state_section.get(p_key) or {}
+        candidates: list[dict[str, Any]] = []
+        for zone_key in ("spaceArena", "groundArena"):
+            candidates.extend(my_state.get(zone_key) or [])
+        leader = my_state.get("leader")
+        if isinstance(leader, dict) and self._zone_name(leader) in ("ground", "space"):
+            candidates.append(leader)
+        for card in candidates:
+            db = self._card_data(card.get("internalName"))
+            card_title = str(db.get("title") or "").lower()
+            if len(card_title) >= 5 and card_title in title:
+                return card
+        return None
+
+    def _ready_enemy_sentinels(self, p_key: str) -> dict[str, float]:
+        sentinels = {"ground": 0.0, "space": 0.0}
+        opp_key = "player2" if p_key == "player1" else "player1"
+        state_section = (self.current_state or {}).get("state") or {}
+        opp_state = state_section.get(opp_key) or {}
+        for arena, zone_key in (("ground", "groundArena"), ("space", "spaceArena")):
+            for card in opp_state.get(zone_key) or []:
+                if self._is_exhausted(card):
+                    continue
+                if self._keyword_flags(self._card_data(card.get("internalName"))).get("sentinel"):
+                    sentinels[arena] += 1.0
+        leader = opp_state.get("leader")
+        if isinstance(leader, dict) and not self._is_exhausted(leader):
+            zone = self._zone_name(leader)
+            if zone in sentinels and self._keyword_flags(self._card_data(leader.get("internalName"))).get("sentinel"):
+                sentinels[zone] += 1.0
+        return sentinels
+
+    def _attack_target_allowed(self, attacker: dict[str, Any], meta: dict[str, Any], p_key: str) -> bool:
+        """Arena + Sentinel legality for one attack-target action."""
+        attacker_zone = self._zone_name(attacker)
+        target_zone = meta.get("targetZone")
+        # Bases can be attacked from either arena.
+        if target_zone == "base":
+            return True
+        if target_zone not in ("ground", "space") or attacker_zone is None:
+            return True
+        # Space units cannot attack ground targets, and vice versa.
+        if attacker_zone in ("ground", "space") and attacker_zone != target_zone:
+            return False
+        attacker_keywords = self._keyword_flags(self._card_data(attacker.get("internalName")))
+        if attacker_keywords.get("saboteur"):
+            return True
+        if meta.get("targetIsSentinel"):
+            return True
+        sentinels = self._ready_enemy_sentinels(p_key)
+        return float(sentinels.get(target_zone, 0.0)) <= 0.0
+
+    def _apply_dynamic_action_masking(self, player_prompt: dict[str, Any] | None, p_key: str) -> np.ndarray:
+        """Build the binary legal_action_mask for the current action list."""
+        actions = self.available_actions
+        n = len(actions)
+        mask = np.zeros(max(self.max_action_space, n), dtype=np.int8)
+        if n == 0:
+            self.legal_action_mask = mask
+            return mask
+
+        intent = self._classify_prompt_intent(player_prompt)
+
+        enemy_target_exists = any(
+            (action.get("meta") or {}).get("targetOwner") == "enemy"
+            for action in actions if action.get("actionType") in self.CARD_ACTION_TYPES
+        )
+
+        is_target_prompt = intent["is_attack"] and not intent["is_attack_with"]
+        attacker = self._resolve_attacker(player_prompt, p_key) if is_target_prompt else None
+
+        for index, action in enumerate(actions):
+            allowed = True
+            meta = action.get("meta") or {}
+            owner = meta.get("targetOwner")
+            if action.get("actionType") in self.CARD_ACTION_TYPES and owner:
+                # 1) Positive stat buffs / shields / friendly upgrades → enemy targets masked.
+                if intent["is_positive"] and owner == "enemy":
+                    allowed = False
+                # 2) Damage / negative modifiers / defeat → friendly targets masked,
+                #    unless no enemy targets exist (self-sacrifice fallback).
+                if intent["is_negative"] and owner == "me" and enemy_target_exists:
+                    allowed = False
+                # 3) + 4) Attack prompts: arena enforcement and Sentinel enforcement.
+                if is_target_prompt:
+                    if owner == "enemy":
+                        allowed = self._attack_target_allowed(attacker, meta, p_key) if attacker else True
+                    else:
+                        allowed = not enemy_target_exists
+            if allowed:
+                mask[index] = 1
+
+        # Safety valve: never leave an active prompt with zero legal actions.
+        if int(mask.sum()) == 0:
+            mask[:n] = 1
+        self.legal_action_mask = mask
+        return mask
 
     def _get_obs(self):
         """
-        Extract numerical features from the JSON state into a fixed-size numpy array.
-        For a CNN/Transformer, you'd map this out properly.
-        Presently returns a zeroed pseudo representation.
+        Encode the current game state as the structured SWU State Tensor.
+
+        Layout (offsets defined by the module-level block constants):
+          Block 1 [0..14)     Global, Force & Economic
+            0  active player is the controlled player (1/0)
+            1  controlled player holds initiative (1/0; this API serializes the
+               initiative holder as `activePlayer`)
+            2  phase hash (sum of char codes mod 100)
+            3  friendly has Force token (1/0)
+            4  enemy has Force token (1/0)
+            5  friendly credits | 6 enemy credits
+            7  friendly ready resources | 8 friendly exhausted resources
+            9  enemy ready resources | 10 enemy exhausted resources
+            11 friendly hand count | 12 enemy hand count | 13 reserved
+          Block 2 [14..144)   Bases & Leaders
+            friendly base  [maxHp, currentHp, epicActionAvailable] + 59 BASE_TRAITS
+            enemy base     [maxHp, currentHp, epicActionAvailable] + 59 BASE_TRAITS
+            friendly leader [isDeployed, epicAction/DeployUsed, isExhausted]
+            enemy leader    [isDeployed, epicAction/DeployUsed, isExhausted]
+          Block 3 [144..264) Friendly Hand — 10 slots × 12:
+            [cost, printedPower, maxHp, type(1=unit/2=event/3=upgrade),
+             playable, isUnique] + 6 ASPECTS multi-hot
+          Block 4 [264..274) Opponent info-set densities (10 categories):
+            (deck definition - discard pile) / remaining deck size
+          Block 5 [274..2386) Dual arenas: ground-me, ground-opp, space-me,
+            space-opp; 6 slots each; 88 floats per slot:
+              0 occupied | 1 isLeaderUnit | 2 isTokenUnit | 3 isUnique
+              4 printedCost | 5 currentPower | 6 maxHp | 7 currentHp
+              8 isExhausted | 9 canAttackNow | 10 isLegalTarget
+              11 shieldCount | 12 upgradeCount | 13 upgradePowerBonus
+              14 upgradeHpBonus | 15 sentinel | 16 saboteur | 17 grit
+              18 overwhelm | 19 ambush | 20 hidden/stealth | 21 raid
+              22 restore | 23-28 ASPECTS | 29-87 UNIT_TRAITS
         """
-        obs = np.zeros((64,), dtype=np.float32)
-        if not self.current_state or "state" not in self.current_state:
+        obs = np.zeros(OBS_DIM, dtype=np.float32)
+        state = self.current_state
+        if not state or "state" not in state:
             return obs
 
-        # Simple, deterministic feature encoder (fast to run and stable):
-        # Layout (approx):
-        # 0: phase hash (float)
-        # 1: is_active (0/1)
-        # 2-6: base/leader hp and power for controlled player
-        # 7-11: base/leader hp and power for opponent
-        # 12-20: counts: hand, space, ground, upgrades, resources, credits, valid_actions
-        # 21-40: normalized unit totals and board advantage summary
+        my_key, opp_key = self._my_opp_keys(state)
+        state_section = state.get("state") or {}
+        my_state = state_section.get(my_key) or {}
+        opp_state = state_section.get(opp_key) or {}
 
-        try:
-            info = self.current_state
-            phase = str(info.get("phase", "unknown"))
-            # simple hash: sum of char codes modulo 100
-            obs[0] = sum(ord(c) for c in phase) % 100
+        # ── Block 1: global / force / economy ────────────────────────────────
+        active_id = str(state.get("activePlayer") or "")
+        obs[_OBS_B1 + 0] = 1.0 if active_id == str(self.player_id) else 0.0
+        obs[_OBS_B1 + 1] = obs[_OBS_B1 + 0]
+        phase = str(state.get("phase") or "")
+        obs[_OBS_B1 + 2] = float(sum(ord(ch) for ch in phase) % 100)
+        obs[_OBS_B1 + 3] = 1.0 if my_state.get("hasForceToken") else 0.0
+        obs[_OBS_B1 + 4] = 1.0 if opp_state.get("hasForceToken") else 0.0
+        obs[_OBS_B1 + 5] = self._num(my_state, "credits")
+        obs[_OBS_B1 + 6] = self._num(opp_state, "credits")
+        obs[_OBS_B1 + 7] = self._num(my_state, "readyResourceCount")
+        obs[_OBS_B1 + 8] = self._num(my_state, "exhaustedResourceCount")
+        obs[_OBS_B1 + 9] = self._num(opp_state, "readyResourceCount")
+        obs[_OBS_B1 + 10] = self._num(opp_state, "exhaustedResourceCount")
+        obs[_OBS_B1 + 11] = float(len(my_state.get("hand") or []))
+        obs[_OBS_B1 + 12] = float(len(opp_state.get("hand") or []))
+        obs[_OBS_B1 + 13] = 0.0  # reserved
 
-            # Determine which prompt/player is the active player id
-            active_id = self.active_player
-            my_key = None
-            other_key = None
-            if info.get("state"):
-                # map player keys by id comparison
-                p1id = info.get("player1Id")
-                p2id = info.get("player2Id")
-                if str(p1id) == str(self.player_id):
-                    my_key = "player1"
-                    other_key = "player2"
-                elif str(p2id) == str(self.player_id):
-                    my_key = "player2"
-                    other_key = "player1"
-                else:
-                    my_key = "player1"
-                    other_key = "player2"
+        # ── Block 2: bases & leaders ──────────────────────────────────────────
+        def _write_base(offset: int, base_state: dict[str, Any]) -> None:
+            db = self._card_data(base_state.get("internalName"))
+            obs[offset] = self._max_hp(base_state, db)
+            obs[offset + 1] = self._current_hp(base_state, db)
+            obs[offset + 2] = 1.0 if db.get("epicAction") else 0.0
+            obs[offset + 3:offset + 3 + len(BASE_TRAITS)] = self._trait_hot(
+                db.get("traits"), _BASE_TRAIT_INDEX, len(BASE_TRAITS)
+            )
 
-            obs[1] = 1.0 if active_id and str(active_id) == str(self.player_id) else 0.0
+        offset = _OBS_B2
+        _write_base(offset, my_state.get("base") or {})
+        offset += 3 + len(BASE_TRAITS)
+        _write_base(offset, opp_state.get("base") or {})
+        offset += 3 + len(BASE_TRAITS)
 
-            my_state = (info.get("state") or {}).get(my_key, {})
-            other_state = (info.get("state") or {}).get(other_key, {})
+        def _write_leader(offset: int, leader_state: dict[str, Any]) -> None:
+            db = self._card_data(leader_state.get("internalName"))
+            zone = self._zone_name(leader_state)
+            deployed = zone in ("ground", "space")
+            obs[offset] = 1.0 if deployed else 0.0
+            # Leaders deploy by flipping; if deployed and the card has an epic
+            # action, the deploy/epic-action side is treated as used.
+            obs[offset + 1] = 1.0 if (deployed and bool(db.get("epicAction"))) else 0.0
+            obs[offset + 2] = 1.0 if self._is_exhausted(leader_state) else 0.0
 
-            def safe_num(obj, *keys):
-                for k in keys:
-                    v = obj.get(k) if isinstance(obj, dict) else None
-                    if v is not None:
-                        try:
-                            return float(v)
-                        except Exception:
-                            return 0.0
-                return 0.0
+        _write_leader(offset, my_state.get("leader") or {})
+        offset += 3
+        _write_leader(offset, opp_state.get("leader") or {})
+        offset += 3
 
-            obs[2] = safe_num(my_state.get("base", {}), "hp", "remainingHp", "currentHp", "maxHp")
-            obs[3] = safe_num(my_state.get("base", {}), "power", "printedPower")
-            obs[4] = safe_num(my_state.get("leader", {}), "hp", "remainingHp", "currentHp", "maxHp")
-            obs[5] = safe_num(my_state.get("leader", {}), "power", "printedPower")
+        # ── Block 3: friendly hand ────────────────────────────────────────────
+        playable_map = self._debug_playable_map(state)
 
-            obs[6] = safe_num(other_state.get("base", {}), "hp", "remainingHp", "currentHp", "maxHp")
-            obs[7] = safe_num(other_state.get("base", {}), "power", "printedPower")
-            obs[8] = safe_num(other_state.get("leader", {}), "hp", "remainingHp", "currentHp", "maxHp")
-            obs[9] = safe_num(other_state.get("leader", {}), "power", "printedPower")
+        def _hand_cost(card: dict[str, Any]) -> float:
+            cost = self._card_data(card.get("internalName")).get("cost")
+            return float(cost) if cost is not None else 999.0
 
-            # counts and resources
-            obs[10] = float(len(my_state.get("hand", [])))
-            obs[11] = float(len(my_state.get("spaceArena", [])))
-            obs[12] = float(len(my_state.get("groundArena", [])))
-            obs[13] = float(my_state.get("readyResourceCount") or 0)
-            obs[14] = float(my_state.get("exhaustedResourceCount") or 0)
-            obs[15] = float(my_state.get("credits") or 0)
-            obs[16] = float(len(self.available_actions))
-            obs[17] = float(1.0 if any((a.get("actionType") == "statefulPromptResults") for a in self.available_actions) else 0.0)
+        my_hand = sorted(my_state.get("hand") or [], key=_hand_cost, reverse=True)
+        ready_resources = self._num(my_state, "readyResourceCount")
+        for slot in range(HAND_SLOTS):
+            base = _OBS_B3 + slot * HAND_FEATURES
+            if slot >= len(my_hand):
+                continue
+            card = my_hand[slot]
+            db = self._card_data(card.get("internalName"))
+            cost = db.get("cost")
+            printed_power = db.get("power")
+            if printed_power is None:
+                printed_power = self._num(card, "power", "printedPower")
+            obs[base + 0] = float(cost) if cost is not None else 0.0
+            obs[base + 1] = float(printed_power or 0.0)
+            obs[base + 2] = self._max_hp(card, db)
+            obs[base + 3] = self._card_type_scalar(db)
+            can_play = playable_map.get(str(card.get("internalName") or "").lower())
+            if can_play is None:
+                can_play = cost is not None and float(cost) <= ready_resources
+            obs[base + 4] = 1.0 if can_play else 0.0
+            obs[base + 5] = 1.0 if db.get("unique") else 0.0
+            obs[base + 6:base + 12] = self._aspect_hot(db.get("aspects"))
 
-            def _unit_totals(state: dict[str, Any]) -> tuple[float, float, float, float, float]:
-                unit_count = 0.0
-                total_power = 0.0
-                total_hp = 0.0
-                exhausted_count = 0.0
-                leader_base_count = 0.0
+        # ── Block 4: opponent info-set densities ─────────────────────────────
+        obs[_OBS_B4:_OBS_B4 + BLOCK4_SIZE] = self._opponent_deck_densities(opp_key, opp_state)
 
-                for zone in ("spaceArena", "groundArena"):
-                    for c in state.get(zone, []):
-                        unit_count += 1.0
-                        total_power += float(safe_num(c, "power", "printedPower"))
-                        total_hp += float(safe_num(c, "hp", "remainingHp", "currentHp"))
-                        if c.get("exhausted") or c.get("isExhausted") or c.get("is_exhausted"):
-                            exhausted_count += 1.0
-                for key in ("leader", "base"):
-                    card = state.get(key)
-                    if isinstance(card, dict):
-                        leader_base_count += 1.0
-                        total_hp += float(safe_num(card, "hp", "remainingHp", "currentHp"))
-                        total_power += float(safe_num(card, "power", "printedPower"))
-                        if card.get("exhausted") or card.get("isExhausted") or card.get("is_exhausted"):
-                            exhausted_count += 1.0
+        # ── Block 5: dual arena unit matrices ─────────────────────────────────
+        legal_target_uuids: set[str] = set()
+        for seat in ("player1", "player2"):
+            prompt = (state.get("prompts") or {}).get(seat) or {}
+            for uuid in prompt.get("selectableCards") or []:
+                legal_target_uuids.add(str(uuid))
+            for display_card in prompt.get("displayCards") or []:
+                if isinstance(display_card, dict):
+                    uuid = display_card.get("cardUuid") or display_card.get("uuid")
+                    if uuid:
+                        legal_target_uuids.add(str(uuid))
 
-                return unit_count, total_power, total_hp, exhausted_count, leader_base_count
+        def _arena_units(player_state: dict[str, Any], arena_key: str) -> list[dict[str, Any]]:
+            units = list(player_state.get(arena_key) or [])
+            leader = player_state.get("leader")
+            if isinstance(leader, dict):
+                want = "ground" if arena_key == "groundArena" else "space"
+                if self._zone_name(leader) == want and all(
+                    str(unit.get("uuid")) != str(leader.get("uuid")) for unit in units
+                ):
+                    units = units + [leader]
+            return units
 
-            my_unit_count, my_total_power, my_total_hp, my_exhausted_count, my_leader_base_count = _unit_totals(my_state)
-            other_unit_count, other_total_power, other_total_hp, other_exhausted_count, other_leader_base_count = _unit_totals(other_state)
+        def _encode_slot(base: int, unit: dict[str, Any] | None) -> None:
+            if not isinstance(unit, dict) or not unit.get("uuid"):
+                return
+            obs[base + 0] = 1.0
+            db = self._card_data(unit.get("internalName"))
+            types = {str(t).lower() for t in (db.get("types") or [])}
+            keywords = {str(k).lower() for k in (db.get("keywords") or [])}
+            obs[base + 1] = 1.0 if "leader" in types else 0.0
+            obs[base + 2] = 1.0 if "token" in types else 0.0
+            obs[base + 3] = 1.0 if db.get("unique") else 0.0
+            obs[base + 4] = float(db.get("cost") or 0)
+            obs[base + 5] = self._num(unit, "power", "printedPower")
+            obs[base + 6] = self._max_hp(unit, db)
+            obs[base + 7] = self._current_hp(unit, db)
+            exhausted = self._is_exhausted(unit)
+            zone = self._zone_name(unit)
+            ready = (not exhausted) and zone in ("ground", "space")
+            obs[base + 8] = 1.0 if exhausted else 0.0
+            obs[base + 9] = 1.0 if (ready and obs[base + 5] > 0.0) else 0.0
+            obs[base + 10] = 1.0 if str(unit.get("uuid")) in legal_target_uuids else 0.0
+            # The serialized state does not expose live shield tokens; "Shielded"
+            # grants one shield on entry, so encode the floor we can observe.
+            obs[base + 11] = 1.0 if "shielded" in keywords else 0.0
+            upgrades = unit.get("upgrades") or []
+            obs[base + 12] = float(len(upgrades))
+            upgrade_power = 0.0
+            upgrade_hp = 0.0
+            for upgrade in upgrades:
+                upgrade_db = self._card_data(upgrade.get("internalName"))
+                upgrade_power += float(upgrade_db.get("upgradePower") or 0)
+                upgrade_hp += float(upgrade_db.get("upgradeHp") or 0)
+            obs[base + 13] = upgrade_power
+            obs[base + 14] = upgrade_hp
+            flags = self._keyword_flags(db)
+            obs[base + 15] = 1.0 if flags.get("sentinel") else 0.0
+            obs[base + 16] = 1.0 if flags.get("saboteur") else 0.0
+            obs[base + 17] = 1.0 if flags.get("grit") else 0.0
+            obs[base + 18] = 1.0 if flags.get("overwhelm") else 0.0
+            obs[base + 19] = 1.0 if flags.get("ambush") else 0.0
+            obs[base + 20] = 1.0 if flags.get("hidden") else 0.0
+            obs[base + 21] = float(flags.get("raid") or 0.0)
+            obs[base + 22] = float(flags.get("restore") or 0.0)
+            obs[base + 23:base + 23 + len(ASPECTS)] = self._aspect_hot(db.get("aspects"))
+            obs[base + 29:base + 29 + len(UNIT_TRAITS)] = self._trait_hot(
+                db.get("traits"), _UNIT_TRAIT_INDEX, len(UNIT_TRAITS)
+            )
 
-            # normalized totals / summary features
-            obs[21] = my_unit_count / 10.0
-            obs[22] = my_total_power / 20.0
-            obs[23] = my_total_hp / 40.0
-            obs[24] = my_exhausted_count / 10.0
-            obs[25] = my_leader_base_count / 2.0
-
-            obs[26] = other_unit_count / 10.0
-            obs[27] = other_total_power / 20.0
-            obs[28] = other_total_hp / 40.0
-            obs[29] = other_exhausted_count / 10.0
-            obs[30] = other_leader_base_count / 2.0
-
-            obs[31] = (my_total_power - other_total_power) / 20.0
-            obs[32] = (my_total_hp - other_total_hp) / 40.0
-            obs[33] = (my_unit_count - other_unit_count) / 10.0
-            obs[34] = float(my_state.get("readyResourceCount") or 0) / 8.0
-            obs[35] = float(my_state.get("credits") or 0) / 8.0
-
-        except Exception:
-            # fall back to zeros on any encoding error
-            pass
+        group_specs = (
+            (my_state, "groundArena"),
+            (opp_state, "groundArena"),
+            (my_state, "spaceArena"),
+            (opp_state, "spaceArena"),
+        )
+        for group, (player_state, arena_key) in enumerate(group_specs):
+            units = _arena_units(player_state, arena_key)
+            for slot in range(ARENA_SLOTS_PER_SIDE):
+                unit = units[slot] if slot < len(units) else None
+                _encode_slot(
+                    _OBS_B5
+                    + group * ARENA_SLOTS_PER_SIDE * UNIT_SLOT_FEATURES
+                    + slot * UNIT_SLOT_FEATURES,
+                    unit,
+                )
 
         return obs
+
+    def print_agent_knowledge(self) -> None:
+        """Human-readable dump of everything the agent currently observes / may act on."""
+        state = self.current_state
+        if not state or "state" not in state:
+            print("<no state — call reset()/refresh() first>")
+            return
+
+        my_key, opp_key = self._my_opp_keys(state)
+        state_section = state.get("state") or {}
+        my_state = state_section.get(my_key) or {}
+        opp_state = state_section.get(opp_key) or {}
+
+        print("=" * 78)
+        print(f"[Agent Knowledge] player={self.player_id} ({my_key})  phase={state.get('phase')}")
+        active = str(state.get("activePlayer") or "")
+        print(f"  active/initiative : {active or '?'} {'(ME)' if active == str(self.player_id) else '(opponent)'}")
+        print(f"  force token       : me={1 if my_state.get('hasForceToken') else 0}  "
+              f"opp={1 if opp_state.get('hasForceToken') else 0}")
+        print(f"  resources         : me {my_state.get('readyResourceCount', 0)} ready / "
+              f"{my_state.get('exhaustedResourceCount', 0)} exhausted | "
+              f"opp {opp_state.get('readyResourceCount', 0)} ready / "
+              f"{opp_state.get('exhaustedResourceCount', 0)} exhausted")
+        print(f"  credits           : me={my_state.get('credits', 0)}  opp={opp_state.get('credits', 0)}")
+        print(f"  hand / deck       : me {len(my_state.get('hand') or [])} hand / "
+              f"{len(my_state.get('deck') or [])} deck | "
+              f"opp {len(opp_state.get('hand') or [])} hand / {len(opp_state.get('deck') or [])} deck")
+
+        for label, player_state in (("ME ", my_state), ("OPP", opp_state)):
+            base_state = player_state.get("base") or {}
+            base_db = self._card_data(base_state.get("internalName"))
+            base_traits = ", ".join(
+                trait for trait in (base_db.get("traits") or [])
+                if str(trait).lower() in _BASE_TRAIT_INDEX
+            ) or "—"
+            print(f"  {label} BASE   {base_state.get('internalName', '?')} "
+                  f"HP={self._current_hp(base_state, base_db):.0f}/{self._max_hp(base_state, base_db):.0f} "
+                  f"epicAction={'yes' if base_db.get('epicAction') else 'no'} traits=[{base_traits}]")
+            leader_state = player_state.get("leader") or {}
+            leader_db = self._card_data(leader_state.get("internalName"))
+            leader_zone = self._zone_name(leader_state)
+            print(f"  {label} LEADER {leader_state.get('internalName', '?')} "
+                  f"deployed={'yes' if leader_zone in ('ground', 'space') else 'no'} "
+                  f"exhausted={'yes' if self._is_exhausted(leader_state) else 'no'} "
+                  f"HP={self._current_hp(leader_state, leader_db):.0f}/{self._max_hp(leader_state, leader_db):.0f}")
+
+        playable_map = self._debug_playable_map(state)
+
+        def _hand_cost(card: dict[str, Any]) -> float:
+            cost = self._card_data(card.get("internalName")).get("cost")
+            return float(cost) if cost is not None else 999.0
+
+        print("  HAND:")
+        for card in sorted(my_state.get("hand") or [], key=_hand_cost, reverse=True):
+            db = self._card_data(card.get("internalName"))
+            can_play = playable_map.get(str(card.get("internalName") or "").lower())
+            status = "yes" if can_play else ("no" if can_play is not None else "?")
+            print(f"    - {card.get('internalName', '?')} cost={db.get('cost')} "
+                  f"type={'/'.join(db.get('types') or [])} playable={status}")
+
+        densities = self._opponent_deck_densities(opp_key, opp_state)
+        print("  OPPONENT UNSEEN-THREAT DENSITIES ((deck def - discard) / remaining):")
+        for category, label in enumerate(DECK_CATEGORY_LABELS):
+            print(f"    {label:<18} {densities[category]:.3f}")
+
+        for arena_label, arena_key in (("GROUND ARENA", "groundArena"), ("SPACE ARENA", "spaceArena")):
+            print(f"  {arena_label}:")
+            for owner_label, player_state in (("me ", my_state), ("opp", opp_state)):
+                units = list(player_state.get(arena_key) or [])
+                leader_state = player_state.get("leader")
+                want = "ground" if arena_key == "groundArena" else "space"
+                if (isinstance(leader_state, dict) and self._zone_name(leader_state) == want
+                        and all(str(unit.get("uuid")) != str(leader_state.get("uuid")) for unit in units)):
+                    units = units + [leader_state]
+                if not units:
+                    print(f"    [{owner_label}] (empty)")
+                    continue
+                for unit in units:
+                    db = self._card_data(unit.get("internalName"))
+                    flags = self._keyword_flags(db)
+                    active_keywords = [
+                        keyword for keyword in ("sentinel", "saboteur", "grit", "overwhelm", "ambush", "hidden")
+                        if flags.get(keyword)
+                    ]
+                    if flags.get("raid"):
+                        active_keywords.append(f"raid {flags['raid']:.0f}")
+                    if flags.get("restore"):
+                        active_keywords.append(f"restore {flags['restore']:.0f}")
+                    print(f"    [{owner_label}] {unit.get('internalName', '?')} "
+                          f"P={self._num(unit, 'power', 'printedPower'):.0f} "
+                          f"HP={self._current_hp(unit, db):.0f}/{self._max_hp(unit, db):.0f} "
+                          f"exhausted={'yes' if self._is_exhausted(unit) else 'no'} "
+                          f"kw=[{','.join(active_keywords) or '—'}]")
+
+        mask = self.legal_action_mask
+        total = len(self.available_actions)
+        legal = int(mask.sum()) if mask is not None else total
+        print(f"  ACTIONS: {total} available, {legal} mask-enabled")
+        for index, action in enumerate(self.available_actions):
+            allowed = "OK  " if (mask is not None and bool(mask[index])) else "MASK"
+            label = action.get("internalName") or action.get("promptText") or action.get("arg") or "?"
+            print(f"    [{index}] {allowed} {action.get('actionType', '?')} {label}")
+        print("=" * 78)
 
     def _get_info(self):
         active_prompts = []
@@ -966,6 +1797,7 @@ class SWUEnv(gym.Env):
             "activePlayers": self.active_players,
             "activePrompts": active_prompts,
             "num_valid_actions": len(self.available_actions),
+            "num_legal_actions": int(self.legal_action_mask.sum()) if self.legal_action_mask is not None else 0,
             "state_dict": self.current_state
         }
 

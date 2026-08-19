@@ -1,14 +1,30 @@
+"""
+Gated Champion/Candidate self-play training loop for the SWU RL environment.
+
+- Training opponents: 80% of episodes use the current champion checkpoint
+  (`policy_champion.ckpt`); 20% use a randomly sampled past checkpoint from the
+  `checkpoints/` history folder.
+- Every `--tournament_every` episodes, an evaluation tournament runs between
+  the live candidate network and the champion (`--tournament_games` games,
+  first/second player seats alternated evenly). A candidate with win rate >
+  `--promote_win_rate` is promoted to `policy_champion.ckpt`.
+- A2C loss:  Loss = L_policy + value_coef * L_value - entropy_coef * H_entropy
+  computed from `batch_logps`, `batch_values`, `batch_returns`.
+- Diagnostics: per-step action dumps are suppressed by default; a clean summary
+  line is printed every `--diagnostics_every` episodes; TensorBoard logs are
+  written when the `tensorboard` package is available.
+"""
+
 import argparse
 import copy
 import json
-import math
 import os
 import random
 import re
 import time
+from typing import Any, Callable
+
 import torch
-import csv
-from tqdm import tqdm
 
 from swu_env import SWUEnv
 from policy import RandomActionPolicy
@@ -16,7 +32,18 @@ from runner import EpisodeLogger
 from torch_policy import TorchPolicy
 from deck_utils import load_deck
 
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    TENSORBOARD_AVAILABLE = True
+except Exception:  # tensorboard is an optional dependency
+    TENSORBOARD_AVAILABLE = False
 
+
+CHAMPION_FILENAME = "policy_champion.ckpt"
+HISTORY_DIRNAME = "checkpoints"
+
+
+# ── Reward / state helpers ───────────────────────────────────────────────────
 def discounted_returns(rewards, gamma=0.99):
     R = 0.0
     returns = []
@@ -219,69 +246,276 @@ def _infer_episode_from_checkpoint_path(checkpoint_path: str) -> int | None:
     return None
 
 
-class SnapshotOpponent:
-    """Opponent that starts random, then switches to a frozen copy of the agent's
-    policy that lags behind by `lag` episodes, synced every `sync_interval` episodes."""
+# ── Gated champion pool ──────────────────────────────────────────────────────
+class ChampionPool:
+    """
+    Persistent champion checkpoint plus a library of historical checkpoints.
 
-    def __init__(self, agent_policy, device, warmup=50, lag=10, verbose=False):
-        self.random_policy = RandomActionPolicy()
-        self.warmup = warmup
-        self.lag = lag
-        self.current_ep = 0
-        self._using_frozen = False
-        self._verbose = verbose
+    `sample_opponent()` implements the gate:
+      80% of episodes → the current champion weights
+      20% of episodes → a randomly selected past checkpoint from `checkpoints/`
+    """
 
-        # Build a detached copy of the agent's network
-        obs_size = agent_policy.net.obs_encoder[0].in_features
-        self.frozen_policy = TorchPolicy(
-            obs_size=obs_size,
-            action_feature_size=agent_policy.action_feature_size,
-            device=device,
+    def __init__(
+        self,
+        log_dir: str,
+        champion_path: str,
+        obs_size: int,
+        max_actions: int,
+        device: str,
+        champion_probability: float = 0.8,
+        verbose: bool = True,
+    ):
+        self.log_dir = log_dir
+        self.champion_path = champion_path
+        self.history_dir = os.path.join(log_dir, HISTORY_DIRNAME)
+        self.obs_size = obs_size
+        self.max_actions = max_actions
+        self.device = device
+        self.champion_probability = float(champion_probability)
+        self.verbose = verbose
+        os.makedirs(self.history_dir, exist_ok=True)
+
+        self.champion = self._make_policy()
+        self.has_champion = False
+        if os.path.exists(self.champion_path):
+            state_dict = self._load_model_weights(self.champion_path)
+            if state_dict is not None:
+                self.champion.net.load_state_dict(state_dict)
+                self.has_champion = True
+
+    def _make_policy(self) -> TorchPolicy:
+        return TorchPolicy(obs_size=self.obs_size, max_actions=self.max_actions, device=self.device)
+
+    @staticmethod
+    def _load_model_weights(path: str):
+        try:
+            checkpoint = torch.load(path, map_location="cpu")
+        except Exception:
+            return None
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+            return checkpoint["model_state_dict"]
+        if isinstance(checkpoint, dict):
+            return checkpoint
+        return None
+
+    def save_champion(self, policy: TorchPolicy, episode: int | None = None, reason: str = "") -> str:
+        """Persist the candidate's weights as the new champion."""
+        payload = {
+            "model_state_dict": {key: value.detach().cpu() for key, value in policy.net.state_dict().items()},
+            "episode": episode,
+            "reason": reason,
+        }
+        torch.save(payload, self.champion_path)
+        self.champion.net.load_state_dict(policy.net.state_dict())
+        self.has_champion = True
+        if self.verbose:
+            print(f"[champion] saved to {self.champion_path}" + (f" — {reason}" if reason else ""))
+        return self.champion_path
+
+    def register_checkpoint(self, policy: TorchPolicy, episode: int) -> str:
+        """Archive the current weights into the history folder for later sampling."""
+        path = os.path.join(self.history_dir, f"policy_ep{episode}.pt")
+        torch.save(policy.net.state_dict(), path)
+        return path
+
+    def sample_opponent(self) -> TorchPolicy | None:
+        """Sample an opponent policy: champion with `champion_probability`,
+        otherwise a random historical checkpoint (falls back to the champion)."""
+        if self.has_champion and random.random() < self.champion_probability:
+            return self.champion
+
+        history = sorted(
+            name for name in os.listdir(self.history_dir)
+            if name.endswith(".pt") or name.endswith(".ckpt")
         )
+        if history:
+            state_dict = self._load_model_weights(os.path.join(self.history_dir, random.choice(history)))
+            if state_dict is not None:
+                snapshot = self._make_policy()
+                try:
+                    snapshot.net.load_state_dict(state_dict)
+                    return snapshot
+                except Exception:
+                    pass
 
-    def sync_from(self, source_policy):
-        """Copy the agent's current weights into the frozen opponent network."""
-        self.frozen_policy.net.load_state_dict(source_policy.net.state_dict())
+        if self.has_champion:
+            return self.champion
+        return None
 
-    def on_episode_end(self, episode_number: int):
-        """Call at the end of each episode to manage warmup / lag."""
-        self.current_ep = episode_number
-        if not self._using_frozen and episode_number >= self.warmup:
-            self._using_frozen = True
-            if self._verbose:
-                print(f"[opponent] warmup done, switching to frozen policy at episode {episode_number}")
 
-    # def _safe_fallback(self, env, actions: list) -> int | None:
-    #     """If the prompt has both card-click actions and a safe "Done"/"Pass"/"Cancel"
-    #     button, prefer the button to avoid getting stuck on multi-select prompts."""
-    #     has_card_clicks = any(a.get("actionType") in {"clickCard", "displayCardClick", "perCardMenuButton"} for a in actions)
-    #     if not has_card_clicks:
-    #         return None
-    #     safe_texts = {"done", "pass", "take nothing", "choose nothing", "cancel", "play cards in selection order"}
-    #     for i, a in enumerate(actions):
-    #         if a.get("actionType") == "clickPrompt":
-    #             text = str(a.get("promptText", "")).strip().lower()
-    #             if text in safe_texts:
-    #                 return i
-    #     return None
+# ── Opponent / action helpers ────────────────────────────────────────────────
+def _policy_action(policy, env) -> int | None:
+    """Sample a masked action index from a TorchPolicy (or a legacy policy)."""
+    actions = list(env.available_actions)
+    if not actions:
+        return None
+    if isinstance(policy, TorchPolicy):
+        with torch.no_grad():
+            obs_vec = torch.tensor(env._get_obs(), dtype=torch.float32)
+            idx, _, _ = policy.select_action(obs_vec, actions, getattr(env, "legal_action_mask", None))
+        return idx if idx is not None and 0 <= idx < len(actions) else None
+    try:
+        return policy.choose_action_index(env)
+    except Exception:
+        return None
+
+
+class PolicyOpponent:
+    """Wraps a frozen TorchPolicy with a random-policy fallback."""
+
+    def __init__(self, policy=None, fallback=None):
+        self.policy = policy
+        self.fallback = fallback if fallback is not None else RandomActionPolicy()
 
     def choose_action_index(self, env) -> int | None:
-        if not self._using_frozen:
-            return self.random_policy.choose_action_index(env)
-
-        actions = list(env.available_actions)
-        if not actions:
-            return None
-
-        # fallback = self._safe_fallback(env, actions)
-        # if fallback is not None:
-        #     return fallback
-
-        obs_vec = torch.tensor(env._get_obs(), dtype=torch.float32)
-        idx, _ = self.frozen_policy.select_action(obs_vec, actions)
-        return idx
+        if self.policy is None:
+            return self.fallback.choose_action_index(env)
+        index = _policy_action(self.policy, env)
+        return index if index is not None else self.fallback.choose_action_index(env)
 
 
+# ── Evaluation tournament ────────────────────────────────────────────────────
+def _resolve_winner(env) -> str | None:
+    """'player1' | 'player2' | 'draw' | None (unresolved), from base HP."""
+    state = env.current_state or {}
+    section = state.get("state") or {}
+    p1 = _unit_board_metrics(section, "player1")
+    p2 = _unit_board_metrics(section, "player2")
+    p1_dead = p1["base_hp"] <= 0.0
+    p2_dead = p2["base_hp"] <= 0.0
+    if p1_dead and not p2_dead:
+        return "player2"
+    if p2_dead and not p1_dead:
+        return "player1"
+    if p1_dead and p2_dead:
+        return "draw"
+    return None
+
+
+def play_one_game(env, p1_policy, p2_policy, reset_payload: dict, max_steps: int = 1000, stall_polls: int = 40) -> str | None:
+    """Run one full episode to completion. Returns winner seat or None."""
+    env.reset(options=reset_payload)
+    last_signature = None
+    stall_count = 0
+
+    for _ in range(max_steps):
+        info = env._get_info()
+        state = env.current_state or {}
+        valid_actions = len(env.available_actions)
+        prompts = state.get("prompts") or {}
+        signature = (
+            str(info.get("activePlayer")),
+            str(info.get("phase")),
+            valid_actions,
+            str((prompts.get("player1") or {}).get("menuTitle", "")),
+            str((prompts.get("player2") or {}).get("menuTitle", "")),
+        )
+
+        if valid_actions == 0:
+            stall_count = stall_count + 1 if signature == last_signature else 1
+            last_signature = signature
+            if stall_count >= stall_polls:
+                return None
+            try:
+                env.refresh()
+            except Exception:
+                return None
+            time.sleep(0.01)
+            continue
+        last_signature = signature
+        stall_count = 0
+
+        active = str(info.get("activePlayer") or "")
+        seat = "player2" if active == str(state.get("player2Id")) else "player1"
+        policy = p1_policy if seat == "player1" else p2_policy
+        action_index = _policy_action(policy, env)
+        if action_index is None:
+            try:
+                env.refresh()
+            except Exception:
+                return None
+            time.sleep(0.01)
+            continue
+
+        _, _, terminated, truncated, _ = env.step(action_index)
+        if terminated or truncated:
+            break
+
+    return _resolve_winner(env)
+
+
+def run_tournament(
+    env,
+    candidate,
+    champion,
+    reset_payload_factory: Callable[[], dict],
+    games: int = 50,
+    max_steps: int = 1000,
+    stall_polls: int = 40,
+    verbose: bool = True,
+) -> dict[str, Any]:
+    """
+    Candidate-vs-champion evaluation tournament.
+
+    Player seats alternate evenly (candidate plays P1 on even game indexes),
+    so a `games=50` tournament is 25 games per seat. Win rate is computed over
+    decisive games (candidate wins + champion wins).
+    """
+    stats = {
+        "games": 0,
+        "candidate_wins": 0,
+        "champion_wins": 0,
+        "draws": 0,
+        "unresolved": 0,
+        "candidate_win_rate": 0.0,
+    }
+    for game in range(games):
+        candidate_is_p1 = game % 2 == 0
+        p1 = candidate if candidate_is_p1 else champion
+        p2 = champion if candidate_is_p1 else candidate
+        winner = play_one_game(env, p1, p2, reset_payload_factory(), max_steps=max_steps, stall_polls=stall_polls)
+        stats["games"] += 1
+        if winner is None:
+            stats["unresolved"] += 1
+        elif winner == "draw":
+            stats["draws"] += 1
+        elif winner == "player1":
+            if candidate_is_p1:
+                stats["candidate_wins"] += 1
+            else:
+                stats["champion_wins"] += 1
+        else:
+            if candidate_is_p1:
+                stats["champion_wins"] += 1
+            else:
+                stats["candidate_wins"] += 1
+        if verbose and (game + 1) % 10 == 0:
+            print(f"  [tournament] game {game + 1}/{games} — candidate {stats['candidate_wins']} : "
+                  f"champion {stats['champion_wins']} (draws {stats['draws']}, unresolved {stats['unresolved']})")
+
+    decisive = max(1, stats["candidate_wins"] + stats["champion_wins"])
+    stats["candidate_win_rate"] = stats["candidate_wins"] / decisive
+    return stats
+
+
+# ── TensorBoard ──────────────────────────────────────────────────────────────
+class MetricsBoard:
+    """Thin TensorBoard wrapper; silently no-ops when unavailable or disabled."""
+
+    def __init__(self, enabled: bool, log_dir: str):
+        self.writer = SummaryWriter(log_dir=os.path.join(log_dir, "tensorboard")) if enabled else None
+
+    def scalar(self, tag: str, value: float, step: int) -> None:
+        if self.writer is not None:
+            self.writer.add_scalar(tag, value, step)
+
+    def close(self) -> None:
+        if self.writer is not None:
+            self.writer.close()
+
+
+# ── Main training loop ───────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--server_url", default="http://localhost:3005")
@@ -297,25 +531,54 @@ def main():
     parser.add_argument("--p2", type=str, help="Deck key for player 2")
     parser.add_argument("--randomize_decks", action="store_true", help="Sample fresh decks from decks.json for every episode")
     parser.add_argument("--checkpoint", type=str, default=None, help="Resume from a saved checkpoint (.pt or .ckpt)")
-    parser.add_argument("--checkpoint_every", type=int, default=10, help="Write a numbered checkpoint every N episodes")
+    parser.add_argument("--checkpoint_every", type=int, default=10, help="Archive candidate weights into the checkpoints history every N episodes")
     parser.add_argument("--stall_polls", type=int, default=40, help="Abort an episode after this many repeated no-action polls in the same prompt state")
-    parser.add_argument("--update_every", type=int, default=1, help="Accumulate this many episodes before each policy update (minibatch). 1 = classic REINFORCE, 8-16 recommended for stability")
-    parser.add_argument("--quiet", action="store_true", help="Suppress verbose logs; show a tqdm progress bar instead")
-    parser.add_argument("--opponent_policy", type=str, default="random", choices=["random", "old_policy"], help="Policy to use for opponent actions")
-    parser.add_argument("--opponent_warmup", type=int, default=50, help="Episodes of random opponent before switching to old_policy")
-    parser.add_argument("--opponent_lag", type=int, default=10, help="How many episodes behind the agent the opponent policy snapshot is taken")
+    parser.add_argument("--update_every", type=int, default=1, help="Accumulate this many episodes before each policy update (minibatch). 1 = per-episode update, 8-16 recommended for stability")
+    parser.add_argument("--quiet", action="store_true", help="Suppress per-episode chatter; keep diagnostics summary lines")
+    parser.add_argument("--debug_steps", action="store_true", help="Re-enable verbose per-step action dumps (default: suppressed)")
+
+    # Gated champion pool
+    parser.add_argument("--champion_path", type=str, default="", help=f"Champion checkpoint path (default: <log_dir>/{CHAMPION_FILENAME})")
+    parser.add_argument("--champion_probability", type=float, default=0.8, help="Fraction of training episodes against the champion (rest: random history checkpoint)")
+    parser.add_argument("--tournament_every", type=int, default=500, help="Run the evaluation tournament every N episodes (also after the final episode)")
+    parser.add_argument("--tournament_games", type=int, default=50, help="Games per evaluation tournament (P1/P2 seats alternate evenly)")
+    parser.add_argument("--promote_win_rate", type=float, default=0.55, help="Candidate win rate threshold for champion promotion")
+
+    # A2C loss coefficients
+    parser.add_argument("--value_coef", type=float, default=0.5, help="c1: critic loss weight")
+    parser.add_argument("--entropy_coef", type=float, default=0.01, help="c2: entropy bonus weight")
+
+    # Diagnostics
+    parser.add_argument("--diagnostics_every", type=int, default=20, help="Print the clean summary line every N episodes (clamped to 10-50)")
+    parser.add_argument("--no_tensorboard", action="store_true", help="Disable TensorBoard logging even when available")
+
     args = parser.parse_args()
 
     verbose = not args.quiet
-    logger = EpisodeLogger(log_dir=args.log_dir, verbose=verbose)
-    env = SWUEnv(server_url=args.server_url, player_id=args.player_id, single_agent_mode=True)
-    policy = TorchPolicy(obs_size=64, action_feature_size=40, lr=args.lr, device=args.device)
+    log_dir = args.log_dir
+    os.makedirs(log_dir, exist_ok=True)
+    champion_path = args.champion_path or os.path.join(log_dir, CHAMPION_FILENAME)
 
-    # Opponent setup — defined here so we can reference the agent's policy
-    if args.opponent_policy == "random":
-        opponent = RandomActionPolicy()
-    else:
-        opponent = SnapshotOpponent(policy, args.device, warmup=args.opponent_warmup, lag=args.opponent_lag, verbose=verbose)
+    logger = EpisodeLogger(log_dir=log_dir, verbose=verbose)
+    env = SWUEnv(server_url=args.server_url, player_id=args.player_id, single_agent_mode=True)
+    policy = TorchPolicy(
+        obs_size=env.observation_space.shape[0],
+        max_actions=env.action_space.n,
+        lr=args.lr,
+        device=args.device,
+    )
+
+    champion_pool = ChampionPool(
+        log_dir=log_dir,
+        champion_path=champion_path,
+        obs_size=policy.obs_size,
+        max_actions=policy.max_actions,
+        device=args.device,
+        champion_probability=args.champion_probability,
+        verbose=verbose,
+    )
+
+    board = MetricsBoard(TENSORBOARD_AVAILABLE and not args.no_tensorboard, log_dir)
 
     checkpoint_metadata: dict[str, object] = {}
     start_episode = 0
@@ -329,48 +592,65 @@ def main():
             print(f"Checkpoint metadata: {checkpoint_metadata}")
         start_episode = int(checkpoint_metadata.get("episode") or _infer_episode_from_checkpoint_path(args.checkpoint) or 0)
 
-    deck_keys = _load_deck_keys(args.decks_file) if args.randomize_decks else []
+    # Seed the champion from the current candidate when no champion exists yet.
+    if not champion_pool.has_champion:
+        champion_pool.save_champion(policy, episode=start_episode, reason="initial champion (no champion file found)")
 
+    deck_keys = _load_deck_keys(args.decks_file) if args.randomize_decks else []
     fixed_reset_payload, fixed_deck_meta = _build_reset_payload(args.p1, args.p2, args.decks_file)
 
-    # Batch accumulators: accumulate episodes before each policy update
-    batch_logps: list[torch.Tensor] = []
-    batch_returns: list[torch.Tensor] = []
-
-    episode_range = range(args.episodes)
-    pbar = tqdm(episode_range, desc="Training", disable=not args.quiet, unit="ep")
-    actual_wins: list[float] = []
-
-    # Best / worst episode tracking (top-5 by reward margin)
-    best_episodes: list[dict] = []   # sorted best→worst
-    worst_episodes: list[dict] = []  # sorted worst→best
-    MAX_TRACKED = 5
-
-    for ep in episode_range:
-        episode_number = start_episode + ep + 1
-        if verbose:
-            print(f"=== Episode {episode_number}/{start_episode + args.episodes} ===")
+    def make_reset_payload() -> dict:
         if args.randomize_decks:
             p1_key, p2_key = _sample_episode_decks(deck_keys)
-            reset_payload, deck_meta = _build_reset_payload(p1_key, p2_key, args.decks_file)
-        else:
-            reset_payload, deck_meta = fixed_reset_payload, fixed_deck_meta
+            return _build_reset_payload(p1_key, p2_key, args.decks_file)[0]
+        return copy.deepcopy(fixed_reset_payload)
 
+    # Batch accumulators for the A2C update
+    batch_logps: list[torch.Tensor] = []
+    batch_returns: list[torch.Tensor] = []
+    batch_values: list[torch.Tensor] = []
+
+    # Diagnostics window + last-known loss components
+    diagnostics_every = max(10, min(50, args.diagnostics_every))
+    window_returns: list[float] = []
+    window_wins = 0.0
+    window_episodes = 0
+    last_losses = {"policy": 0.0, "value": 0.0, "entropy": 0.0, "total": 0.0}
+    last_tournament: dict[str, Any] | None = None
+    promotions = 0
+
+    for ep in range(args.episodes):
+        episode_number = start_episode + ep + 1
+        reset_payload = make_reset_payload()
         obs, info = env.reset(options=reset_payload)
-        logger.log(
-            f"[reset] phase={info.get('phase')} activePlayer={info.get('activePlayer')} valid_actions={info.get('num_valid_actions')} prompts={info.get('activePrompts')}",
-            player_id=args.player_id,
-        )
-        logger.log(
-            f"[reset] deck_args p1={deck_meta.get('p1')!r} p2={deck_meta.get('p2')!r} player1Id={env.current_state.get('player1Id') if env.current_state else None} player2Id={env.current_state.get('player2Id') if env.current_state else None}",
-            player_id=args.player_id,
-        )
-        logger.record_rl_transition({"event": "reset", "player_id": args.player_id, "state": env.current_state, "available_actions": env.available_actions, "info": info, "decks": deck_meta})
+        if verbose:
+            print(f"=== Episode {episode_number}/{start_episode + args.episodes} ===")
+            logger.log(
+                f"[reset] phase={info.get('phase')} activePlayer={info.get('activePlayer')} valid_actions={info.get('num_valid_actions')} prompts={info.get('activePrompts')}",
+                player_id=args.player_id,
+            )
+        logger.record_rl_transition({
+            "event": "reset",
+            "player_id": args.player_id,
+            "state": env.current_state,
+            "available_actions": env.available_actions,
+            "info": info,
+            "decks": fixed_deck_meta if not args.randomize_decks else {},
+        })
 
-        logps = []
-        rewards = []
+        # ── Gated opponent sampling: 80% champion / 20% history checkpoint ──
+        opponent_policy = champion_pool.sample_opponent()
+        opponent = PolicyOpponent(opponent_policy)
+        if verbose:
+            source = "champion" if opponent_policy is champion_pool.champion else ("history" if opponent_policy is not None else "random")
+            print(f"[opponent] episode {episode_number} opponent source: {source}")
+
+        logps: list[torch.Tensor] = []
+        rewards: list[float] = []
+        values: list[torch.Tensor] = []
         step_idx = 0
         terminated = False
+        step_info = None
 
         episode_metrics = {
             "episode": episode_number,
@@ -405,72 +685,12 @@ def main():
             "agent_max_valid_actions": 0,
             "final_phase": None,
             "winner": None,
-            "regroup_segments": [],
-            "regroup_segment_count": 0,
-            "regroup_action_total": 0,
-            "regroup_card_action_total": 0,
-            "regroup_agent_action_total": 0,
-            "regroup_opponent_action_total": 0,
             "cards_played": 0,
             "agent_cards_played": 0,
         }
 
-        seen_regroup_phase = False
-        current_regroup_action_count = 0
-        current_regroup_card_action_count = 0
-        current_regroup_agent_action_count = 0
-        current_regroup_opponent_action_count = 0
-        current_regroup_start_step = None
-        current_regroup_rewards = 0.0
-        current_regroup_steps = 0
         no_action_poll_count = 0
         last_stall_signature = None
-        turn_number = 0
-        last_turn_phase = None
-
-        def _finalize_regroup_segment(next_phase: str | None) -> None:
-            nonlocal current_regroup_action_count
-            nonlocal current_regroup_card_action_count
-            nonlocal current_regroup_agent_action_count
-            nonlocal current_regroup_opponent_action_count
-            nonlocal current_regroup_start_step
-            nonlocal current_regroup_rewards
-            nonlocal current_regroup_steps
-            if not seen_regroup_phase or current_regroup_action_count <= 0:
-                current_regroup_action_count = 0
-                current_regroup_card_action_count = 0
-                current_regroup_agent_action_count = 0
-                current_regroup_opponent_action_count = 0
-                current_regroup_start_step = None
-                current_regroup_rewards = 0.0
-                current_regroup_steps = 0
-                return
-
-            segment = {
-                "start_step": current_regroup_start_step,
-                "end_step": step_idx,
-                "action_count": current_regroup_action_count,
-                "card_action_count": current_regroup_card_action_count,
-                "agent_action_count": current_regroup_agent_action_count,
-                "opponent_action_count": current_regroup_opponent_action_count,
-                "reward_total": current_regroup_rewards,
-                "reward_per_step": current_regroup_rewards / max(1, current_regroup_steps),
-                "next_phase": next_phase,
-            }
-            episode_metrics["regroup_segments"].append(segment)
-            episode_metrics["regroup_segment_count"] += 1
-            episode_metrics["regroup_action_total"] += current_regroup_action_count
-            episode_metrics["regroup_card_action_total"] += current_regroup_card_action_count
-            episode_metrics["regroup_agent_action_total"] += current_regroup_agent_action_count
-            episode_metrics["regroup_opponent_action_total"] += current_regroup_opponent_action_count
-
-            current_regroup_action_count = 0
-            current_regroup_card_action_count = 0
-            current_regroup_agent_action_count = 0
-            current_regroup_opponent_action_count = 0
-            current_regroup_start_step = None
-            current_regroup_rewards = 0.0
-            current_regroup_steps = 0
 
         while not terminated and step_idx < args.max_steps:
             info = env._get_info()
@@ -493,12 +713,8 @@ def main():
                     no_action_poll_count = 1
                 last_stall_signature = stall_signature
             elif valid_actions == 0 and active is None:
-                # Server didn't report an active player — treat as agent stall
-                # if the controlled player has a prompt waiting.
                 agent_key = _player_key_for_id(state_snapshot, args.player_id)
                 agent_prompt = (prompt_snapshot.get(agent_key) if agent_key else None) or {}
-                opp_key = "player2" if agent_key == "player1" else "player1"
-                opp_prompt = prompt_snapshot.get(opp_key, {}) if opp_key else {}
                 if agent_prompt and "waiting for opponent" not in str(agent_prompt.get("menuTitle", "")).lower():
                     if stall_signature == last_stall_signature:
                         no_action_poll_count += 1
@@ -538,56 +754,19 @@ def main():
             episode_metrics["opp_unit_count_sum"] += opp_board["unit_count"]
             episode_metrics["opp_exhausted_sum"] += opp_board["exhausted_count"]
             episode_metrics["opp_hand_sum"] += opp_board["hand_count"]
-            logger.log(
-                f"[loop] step={step_idx} phase={phase} activePlayer={active} valid_actions={len(env.available_actions)} "
-                f"prompt1={str((prompt_snapshot.get('player1') or {}).get('menuTitle', ''))!r} "
-                f"prompt2={str((prompt_snapshot.get('player2') or {}).get('menuTitle', ''))!r}",
-                player_id=args.player_id,
-            )
-            _log_available_actions(logger, args.player_id, list(env.available_actions))
 
-            # Detect turn boundaries: a new turn begins when entering regroup phase
-            if _is_regroup_phase(phase) and last_turn_phase != "regroup":
-                turn_number += 1
-            last_turn_phase = phase
-
-            # Record step analysis data
-            step_analysis_payload = {
-                "episode": episode_number,
-                "step_index": step_idx,
-                "turn_number": turn_number,
-                "active_player_id": str(active),
-                "acting_player_id": None,  # Will be filled below
-                "phase": phase,
-                "valid_actions_count": valid_actions,
-                "agent_base_hp": agent_board["base_hp"],
-                "agent_leader_hp": agent_board["leader_hp"],
-                "agent_board_power": agent_board["board_power"],
-                "agent_board_hp": agent_board["board_hp"],
-                "agent_board_damage": agent_board["board_damage"],
-                "agent_unit_count": agent_board["unit_count"],
-                "agent_exhausted_count": agent_board["exhausted_count"],
-                "agent_ready_resources": agent_board["ready_resources"],
-                "agent_credits": agent_board["credits"],
-                "agent_hand_count": agent_board["hand_count"],
-                "opp_base_hp": opp_board["base_hp"],
-                "opp_leader_hp": opp_board["leader_hp"],
-                "opp_board_power": opp_board["board_power"],
-                "opp_board_hp": opp_board["board_hp"],
-                "opp_board_damage": opp_board["board_damage"],
-                "opp_unit_count": opp_board["unit_count"],
-                "opp_exhausted_count": opp_board["exhausted_count"],
-                "opp_hand_count": opp_board["hand_count"],
-                "reward": 0.0,  # Will be filled below
-                "terminated": False,  # Will be filled below
-                "truncated": False,  # Will be filled below
-            }
+            if args.debug_steps:
+                logger.log(
+                    f"[loop] step={step_idx} phase={phase} activePlayer={active} valid_actions={len(env.available_actions)} "
+                    f"prompt1={str((prompt_snapshot.get('player1') or {}).get('menuTitle', ''))!r} "
+                    f"prompt2={str((prompt_snapshot.get('player2') or {}).get('menuTitle', ''))!r}",
+                    player_id=args.player_id,
+                )
+                _log_available_actions(logger, args.player_id, list(env.available_actions))
 
             if no_action_poll_count >= args.stall_polls and str(active) == str(args.player_id):
                 logger.log(
-                    f"[warning] Stalled prompt detected after {no_action_poll_count} polls with zero legal actions. "
-                    f"Aborting episode to skip bad state. phase={phase} prompt1={str((prompt_snapshot.get('player1') or {}).get('menuTitle', ''))!r} "
-                    f"prompt2={str((prompt_snapshot.get('player2') or {}).get('menuTitle', ''))!r}",
+                    f"[warning] Stalled prompt detected after {no_action_poll_count} polls with zero legal actions. Aborting episode.",
                     player_id=args.player_id,
                 )
                 logger.record_rl_transition({
@@ -604,44 +783,22 @@ def main():
                 terminated = True
                 break
 
-            if _is_regroup_phase(phase):
-                _finalize_regroup_segment(phase)
-                seen_regroup_phase = True
-                current_regroup_start_step = step_idx
-                # Log turn summary at the start of a new turn (regroup phase entry)
-                logger.record_turn_summary({
-                    "episode": episode_number,
-                    "turn_number": turn_number,
-                    "step_index": step_idx,
-                    "agent_base_hp": agent_board["base_hp"],
-                    "agent_leader_hp": agent_board["leader_hp"],
-                    "agent_board_power": agent_board["board_power"],
-                    "agent_board_hp": agent_board["board_hp"],
-                    "agent_board_damage": agent_board["board_damage"],
-                    "agent_unit_count": agent_board["unit_count"],
-                    "agent_exhausted_count": agent_board["exhausted_count"],
-                    "agent_ready_resources": agent_board["ready_resources"],
-                    "agent_credits": agent_board["credits"],
-                    "agent_hand_count": agent_board["hand_count"],
-                    "opp_base_hp": opp_board["base_hp"],
-                    "opp_leader_hp": opp_board["leader_hp"],
-                    "opp_board_power": opp_board["board_power"],
-                    "opp_board_hp": opp_board["board_hp"],
-                    "opp_board_damage": opp_board["board_damage"],
-                    "opp_unit_count": opp_board["unit_count"],
-                    "opp_exhausted_count": opp_board["exhausted_count"],
-                    "opp_hand_count": opp_board["hand_count"],
-                })
-
             if str(active) == str(args.player_id):
+                # ── Agent's turn (candidate) ──
                 episode_metrics["agent_turns"] += 1
                 episode_metrics["agent_valid_actions_sum"] += valid_actions
                 episode_metrics["agent_valid_actions_count"] += 1
                 obs_vec = torch.tensor(env._get_obs(), dtype=torch.float32)
                 available_actions = list(env.available_actions)
-                action, logp = policy.select_action(obs_vec, available_actions)
+                action, logp, value = policy.select_action(
+                    obs_vec, available_actions, getattr(env, "legal_action_mask", None)
+                )
                 if action is None:
-                    # Refresh before waiting so a stale prompt snapshot does not spin forever.
+                    if no_action_poll_count >= args.stall_polls:
+                        logger.log(f"[warning] Agent stall aborted episode at step {step_idx}", player_id=args.player_id)
+                        episode_metrics["final_phase"] = phase
+                        terminated = True
+                        break
                     try:
                         env.refresh()
                     except Exception as exc:
@@ -649,51 +806,22 @@ def main():
                         episode_metrics["final_phase"] = phase
                         terminated = True
                         break
-
-                    if len(env.available_actions) == 0:
-                        time.sleep(0.01)
-                    else:
-                        continue
-
-                    if no_action_poll_count >= args.stall_polls:
-                        logger.log(
-                            f"[warning] Stalled prompt detected after {no_action_poll_count} polls with zero legal actions. "
-                            f"Aborting episode to skip bad state. phase={phase} prompt1={str((prompt_snapshot.get('player1') or {}).get('menuTitle', ''))!r} "
-                            f"prompt2={str((prompt_snapshot.get('player2') or {}).get('menuTitle', ''))!r}",
-                            player_id=args.player_id,
-                        )
-                        logger.record_rl_transition({
-                            "event": "episode_abort",
-                            "reason": "stalled_no_action",
-                            "player_id": args.player_id,
-                            "step_index": step_idx,
-                            "state": state_snapshot,
-                            "available_actions": list(env.available_actions),
-                            "info": info,
-                            "stall_polls": no_action_poll_count,
-                        })
-                        episode_metrics["final_phase"] = phase
-                        terminated = True
-                        break
+                    time.sleep(0.01)
                     continue
 
-                # guard: if action unexpectedly out of range, skip it
                 if action >= len(available_actions) or action < 0:
-                    # record a warning and skip
                     logger.log(f"Policy produced invalid action {action} for {len(available_actions)} available", player_id=args.player_id)
                     time.sleep(0.01)
                     continue
 
                 chosen_action = available_actions[action]
-                logger.log(f"[agent] p1 chose [{action}] {_describe_action(chosen_action, action)}", player_id=args.player_id)
+                if args.debug_steps:
+                    logger.log(f"[agent] p1 chose [{action}] {_describe_action(chosen_action, action)}", player_id=args.player_id)
 
                 try:
                     _, reward, terminated, truncated, step_info = env.step(action)
                 except Exception as exc:
-                    logger.log(
-                        f"[agent] step failed; skipping episode: {exc}",
-                        player_id=args.player_id,
-                    )
+                    logger.log(f"[agent] step failed; skipping episode: {exc}", player_id=args.player_id)
                     logger.record_rl_transition({
                         "event": "step_error",
                         "player_id": args.player_id,
@@ -713,29 +841,22 @@ def main():
                     episode_metrics["agent_rewards"] += -10.0
                     episode_metrics["total_rewards"] += -10.0
                     terminated = True
-                    truncated = False
                     step_info = info
                     break
+
                 episode_metrics["total_rewards"] += float(reward)
                 episode_metrics["total_reward_steps"] += 1
                 episode_metrics["agent_rewards"] += float(reward)
-                # Count cards played by the agent (only from hand, not attacks/abilities)
+
                 action_type = str(chosen_action.get("actionType") or "")
                 if action_type == "clickCard":
                     card_uuid = chosen_action.get("uuid", "")
-                    # Check if the clicked card is in the agent's hand zone
                     agent_state = (state_section.get(agent_key) if agent_key else None) or {}
                     in_hand = any(c.get("uuid") == card_uuid for c in agent_state.get("hand", []))
                     if in_hand:
                         episode_metrics["cards_played"] += 1
                         episode_metrics["agent_cards_played"] += 1
-                if not _is_regroup_phase(phase):
-                    current_regroup_action_count += 1
-                    current_regroup_agent_action_count += 1
-                    current_regroup_rewards += float(reward)
-                    current_regroup_steps += 1
-                    if action_type in {"clickCard", "macro_resource_cards"}:
-                        current_regroup_card_action_count += 1
+
                 state_section = (step_info or {}).get("state_dict") or env.current_state or {}
                 logger.record_rl_transition({
                     "event": "step",
@@ -749,20 +870,44 @@ def main():
                     "terminated": terminated,
                     "info": step_info,
                 })
-                step_analysis_payload["acting_player_id"] = args.player_id
-                step_analysis_payload["reward"] = float(reward)
-                step_analysis_payload["terminated"] = terminated
-                step_analysis_payload["truncated"] = truncated
-                logger.record_step_analysis_data(step_analysis_payload)
-                # only append if we have a valid log-prob
+                logger.record_step_analysis_data({
+                    "episode": episode_number,
+                    "step_index": step_idx,
+                    "active_player_id": str(active),
+                    "acting_player_id": args.player_id,
+                    "phase": phase,
+                    "valid_actions_count": valid_actions,
+                    "agent_base_hp": agent_board["base_hp"],
+                    "agent_board_power": agent_board["board_power"],
+                    "agent_board_hp": agent_board["board_hp"],
+                    "agent_unit_count": agent_board["unit_count"],
+                    "agent_ready_resources": agent_board["ready_resources"],
+                    "agent_credits": agent_board["credits"],
+                    "agent_hand_count": agent_board["hand_count"],
+                    "opp_base_hp": opp_board["base_hp"],
+                    "opp_board_power": opp_board["board_power"],
+                    "opp_board_hp": opp_board["board_hp"],
+                    "opp_unit_count": opp_board["unit_count"],
+                    "reward": float(reward),
+                    "terminated": terminated,
+                    "truncated": truncated,
+                })
+
+                # Collect (log_prob, value, reward) for the A2C update.
                 if logp is not None:
                     logps.append(logp)
+                    values.append(value)
                     rewards.append(float(reward))
             else:
+                # ── Opponent's turn (champion / history checkpoint) ──
                 episode_metrics["opponent_turns"] += 1
-                # opponent acts
                 action = opponent.choose_action_index(env)
                 if action is None:
+                    if no_action_poll_count >= args.stall_polls:
+                        logger.log(f"[warning] Opponent stall aborted episode at step {step_idx}", player_id=args.player_id)
+                        episode_metrics["final_phase"] = phase
+                        terminated = True
+                        break
                     try:
                         env.refresh()
                     except Exception as exc:
@@ -770,45 +915,17 @@ def main():
                         episode_metrics["final_phase"] = phase
                         terminated = True
                         break
-
-                    if len(env.available_actions) == 0:
-                        time.sleep(0.01)
-                    else:
-                        continue
-
-                    if no_action_poll_count >= args.stall_polls:
-                        logger.log(
-                            f"[warning] Stalled prompt detected after {no_action_poll_count} polls with zero legal actions. "
-                            f"Aborting episode to skip bad state. phase={phase} prompt1={str((prompt_snapshot.get('player1') or {}).get('menuTitle', ''))!r} "
-                            f"prompt2={str((prompt_snapshot.get('player2') or {}).get('menuTitle', ''))!r}",
-                            player_id=args.player_id,
-                        )
-                        logger.record_rl_transition({
-                            "event": "episode_abort",
-                            "reason": "stalled_no_action",
-                            "player_id": args.player_id,
-                            "step_index": step_idx,
-                            "state": state_snapshot,
-                            "available_actions": list(env.available_actions),
-                            "info": info,
-                            "stall_polls": no_action_poll_count,
-                        })
-                        episode_metrics["final_phase"] = phase
-                        terminated = True
-                        break
+                    time.sleep(0.01)
                     continue
+
                 opponent_action = list(env.available_actions)[action] if 0 <= action < len(env.available_actions) else None
-                if opponent_action is not None:
+                if args.debug_steps and opponent_action is not None:
                     logger.log(f"[opponent] p2 chose [{action}] {_describe_action(opponent_action, action)}", player_id=args.player_id)
-                else:
-                    logger.log(f"[opponent] p2 chose [{action}] unknown", player_id=args.player_id)
+
                 try:
                     _, reward, terminated, truncated, step_info = env.step(action)
                 except Exception as exc:
-                    logger.log(
-                        f"[opponent] step failed; aborting episode: {exc}",
-                        player_id=args.player_id,
-                    )
+                    logger.log(f"[opponent] step failed; aborting episode: {exc}", player_id=args.player_id)
                     logger.record_rl_transition({
                         "event": "step_error",
                         "player_id": "opponent",
@@ -828,26 +945,20 @@ def main():
                     episode_metrics["opponent_rewards"] += -10.0
                     episode_metrics["total_rewards"] += -10.0
                     terminated = True
-                    truncated = False
                     step_info = info
                     break
+
                 episode_metrics["total_rewards"] += float(reward)
                 episode_metrics["total_reward_steps"] += 1
                 episode_metrics["opponent_rewards"] += float(reward)
-                if not _is_regroup_phase(phase):
-                    current_regroup_action_count += 1
-                    current_regroup_opponent_action_count += 1
-                    current_regroup_rewards += float(reward)
-                    current_regroup_steps += 1
-                    if str(opponent_action.get("actionType") if opponent_action else "") in {"clickCard", "macro_resource_cards"}:
-                        current_regroup_card_action_count += 1
-                # Count opponent cards played (only from hand)
+
                 if opponent_action and str(opponent_action.get("actionType") or "") == "clickCard":
                     card_uuid = opponent_action.get("uuid", "")
                     opp_state = (state_section.get(opp_key) if opp_key else None) or {}
                     in_hand = any(c.get("uuid") == card_uuid for c in opp_state.get("hand", []))
                     if in_hand:
                         episode_metrics["cards_played"] += 1
+
                 logger.record_rl_transition({
                     "event": "step",
                     "player_id": "opponent",
@@ -860,11 +971,28 @@ def main():
                     "terminated": terminated,
                     "info": step_info,
                 })
-                step_analysis_payload["acting_player_id"] = "opponent"
-                step_analysis_payload["reward"] = float(reward)
-                step_analysis_payload["terminated"] = terminated
-                step_analysis_payload["truncated"] = truncated
-                logger.record_step_analysis_data(step_analysis_payload)
+                logger.record_step_analysis_data({
+                    "episode": episode_number,
+                    "step_index": step_idx,
+                    "active_player_id": str(active),
+                    "acting_player_id": "opponent",
+                    "phase": phase,
+                    "valid_actions_count": valid_actions,
+                    "agent_base_hp": agent_board["base_hp"],
+                    "agent_board_power": agent_board["board_power"],
+                    "agent_board_hp": agent_board["board_hp"],
+                    "agent_unit_count": agent_board["unit_count"],
+                    "agent_ready_resources": agent_board["ready_resources"],
+                    "agent_credits": agent_board["credits"],
+                    "agent_hand_count": agent_board["hand_count"],
+                    "opp_base_hp": opp_board["base_hp"],
+                    "opp_board_power": opp_board["board_power"],
+                    "opp_board_hp": opp_board["board_hp"],
+                    "opp_unit_count": opp_board["unit_count"],
+                    "reward": float(reward),
+                    "terminated": terminated,
+                    "truncated": truncated,
+                })
 
             step_idx += 1
 
@@ -874,14 +1002,11 @@ def main():
                 if winners:
                     episode_metrics["winner"] = winners[0] if len(winners) == 1 else winners
 
-        _finalize_regroup_segment(None)
-
-        # Determine actual winner from final board state (base HP = 0 → defeated)
+        # ── Episode end: winner resolution ──
         final_state = (env.current_state or {}).get("state") or {}
+        final_agent = _unit_board_metrics(final_state, _player_key_for_id(env.current_state, args.player_id) or "player1")
         agent_key = _player_key_for_id(env.current_state, args.player_id)
-        opp_key = "player2" if agent_key == "player1" else "player1"
-        final_agent = _unit_board_metrics(final_state, agent_key or "player1")
-        final_opp = _unit_board_metrics(final_state, opp_key)
+        final_opp = _unit_board_metrics(final_state, "player2" if agent_key == "player1" else "player1")
         agent_base_dead = final_agent["base_hp"] <= 0.0
         opp_base_dead = final_opp["base_hp"] <= 0.0
         if agent_base_dead and not opp_base_dead:
@@ -893,119 +1018,140 @@ def main():
         else:
             episode_metrics["winner"] = "unresolved"
 
-        # At episode end, accumulate into batch for periodic REINFORCE update
+        # Accumulate the episode into the A2C batch.
         if len(rewards) > 0:
             returns = discounted_returns(rewards, gamma=args.gamma)
             batch_logps.extend(logps)
             batch_returns.extend(returns)
+            batch_values.extend(values)
 
+        # Archive candidate weights into the history folder (for future sampling).
+        if args.checkpoint_every > 0 and episode_number % args.checkpoint_every == 0:
+            champion_pool.register_checkpoint(policy, episode_number)
+
+        # ── A2C update ──
         do_update = (
             len(batch_logps) > 0
             and (
-                (ep + 1) % args.update_every == 0      # reached the batch boundary
-                or ep == args.episodes - 1              # last episode of the run
+                (ep + 1) % args.update_every == 0
+                or ep == args.episodes - 1
             )
         )
         if do_update:
-            loss_val = policy.update(batch_logps, batch_returns)
+            total_loss, policy_loss, value_loss, entropy = policy.update(
+                batch_logps,
+                batch_returns,
+                batch_values,
+                value_coef=args.value_coef,
+                entropy_coef=args.entropy_coef,
+            )
+            last_losses = {"policy": policy_loss, "value": value_loss, "entropy": entropy, "total": total_loss}
             n = len(batch_logps)
             if verbose:
-                print(f"Batch update after episode {episode_number} ({n} steps across last {min(args.update_every, ep + 1)} eps), loss={loss_val:.6f}")
+                print(f"Batch update after episode {episode_number} ({n} steps): "
+                      f"total={total_loss:.4f} policy={policy_loss:.4f} value={value_loss:.4f} entropy={entropy:.4f}")
+            board.scalar("train/total_loss", total_loss, episode_number)
+            board.scalar("train/policy_loss", policy_loss, episode_number)
+            board.scalar("train/value_loss", value_loss, episode_number)
+            board.scalar("train/entropy", entropy, episode_number)
             batch_logps = []
             batch_returns = []
-        else:
-            n_skipped = len(rewards) if rewards else 0
-            if n_skipped > 0 and verbose:
-                print(f"Episode {episode_number} accumulated {n_skipped} steps into batch (next update in {args.update_every - ((ep + 1) % args.update_every)} ep(s))")
+            batch_values = []
 
-        # Opponent lifecycle: warmup tracking + periodic weight sync
-        if isinstance(opponent, SnapshotOpponent):
-            opponent.on_episode_end(episode_number)
-            # Sync agent weights to opponent every `lag` episodes (always sync on warmup end)
-            if opponent._using_frozen and (episode_number % args.opponent_lag == 0):
-                opponent.sync_from(policy)
+        # ── Evaluation tournament & champion gate ──
+        if args.tournament_every > 0 and (episode_number % args.tournament_every == 0 or ep == args.episodes - 1):
+            if verbose:
+                print(f"[tournament] starting {args.tournament_games}-game evaluation (candidate vs champion) after episode {episode_number}")
+            last_tournament = run_tournament(
+                env,
+                candidate=policy,
+                champion=champion_pool.champion,
+                reset_payload_factory=make_reset_payload,
+                games=args.tournament_games,
+                max_steps=args.max_steps,
+                stall_polls=args.stall_polls,
+                verbose=verbose,
+            )
+            win_rate = last_tournament["candidate_win_rate"]
+            if verbose:
+                print(f"[tournament] result: candidate {last_tournament['candidate_wins']} wins, "
+                      f"champion {last_tournament['champion_wins']} wins, draws {last_tournament['draws']}, "
+                      f"unresolved {last_tournament['unresolved']} — candidate win rate {win_rate:.1%}")
+            board.scalar("eval/candidate_win_rate", win_rate, episode_number)
+            board.scalar("eval/champion_wins", float(last_tournament["champion_wins"]), episode_number)
+
+            if win_rate > args.promote_win_rate:
+                champion_pool.save_champion(
+                    policy,
+                    episode=episode_number,
+                    reason=f"promoted: win rate {win_rate:.1%} > {args.promote_win_rate:.1%}",
+                )
+                promotions += 1
+                board.scalar("eval/promotion", 1.0, episode_number)
                 if verbose:
-                    print(f"[opponent] synced policy at episode {episode_number}")
+                    print(f"[promotion] candidate replaced the champion at episode {episode_number}")
+            else:
+                board.scalar("eval/promotion", 0.0, episode_number)
+
+        # ── Diagnostics window ──
+        window_returns.append(float(episode_metrics["agent_rewards"]))
+        window_episodes += 1
+        if episode_metrics["winner"] == "agent":
+            window_wins += 1.0
+
+        board.scalar("episode/agent_return", float(episode_metrics["agent_rewards"]), episode_number)
+        board.scalar("episode/steps", step_idx, episode_number)
+        board.scalar("episode/win", 1.0 if episode_metrics["winner"] == "agent" else 0.0, episode_number)
+        board.scalar(
+            "episode/avg_valid_actions",
+            episode_metrics["valid_actions_sum"] / max(1, episode_metrics["valid_actions_count"]),
+            episode_number,
+        )
 
         summary = {
             **episode_metrics,
             "steps": step_idx,
-            "agent_reward_per_turn": (episode_metrics["agent_rewards"] / max(1, episode_metrics["agent_turns"])),
-            "opponent_reward_per_turn": (episode_metrics["opponent_rewards"] / max(1, episode_metrics["opponent_turns"])),
-            "avg_valid_actions": (episode_metrics["valid_actions_sum"] / max(1, episode_metrics["valid_actions_count"])),
-            "avg_agent_valid_actions": (episode_metrics["agent_valid_actions_sum"] / max(1, episode_metrics["agent_valid_actions_count"])),
-            "cards_played_per_turn": (episode_metrics["cards_played"] / max(1, episode_metrics["agent_turns"] + episode_metrics["opponent_turns"])),
+            "agent_reward_per_turn": episode_metrics["agent_rewards"] / max(1, episode_metrics["agent_turns"]),
+            "opponent_reward_per_turn": episode_metrics["opponent_rewards"] / max(1, episode_metrics["opponent_turns"]),
+            "avg_valid_actions": episode_metrics["valid_actions_sum"] / max(1, episode_metrics["valid_actions_count"]),
+            "avg_agent_valid_actions": episode_metrics["agent_valid_actions_sum"] / max(1, episode_metrics["agent_valid_actions_count"]),
+            "cards_played_per_turn": episode_metrics["cards_played"] / max(1, episode_metrics["agent_turns"] + episode_metrics["opponent_turns"]),
+            "last_tournament_win_rate": last_tournament["candidate_win_rate"] if last_tournament else None,
+            "promotions": promotions,
         }
-
-        reward_margin = summary["agent_rewards"] - summary["opponent_rewards"]
-
-        # Track best / worst episodes by reward margin
-        entry = {
-            "episode": episode_number, "reward_margin": reward_margin,
-            "agent_rewards": summary["agent_rewards"],
-            "opponent_rewards": summary["opponent_rewards"],
-            "steps": summary["steps"], "winner": summary["winner"],
-            "cards_played": summary["cards_played"],
-        }
-        best_episodes.append(entry)
-        best_episodes.sort(key=lambda x: x["reward_margin"], reverse=True)
-        if len(best_episodes) > MAX_TRACKED:
-            best_episodes.pop()
-        worst_episodes.append(entry)
-        worst_episodes.sort(key=lambda x: x["reward_margin"])
-        if len(worst_episodes) > MAX_TRACKED:
-            worst_episodes.pop()
-
-        if verbose:
-            print(
-                f"[episode {episode_number}] steps={summary['steps']} agent_turns={summary['agent_turns']} "
-                f"opp_turns={summary['opponent_turns']} agent_reward={summary['agent_rewards']:.3f} "
-                f"margin={reward_margin:+.3f} winner={summary['winner']} "
-                f"cards_played={summary['cards_played']} "
-                f"regroup_segments={summary['regroup_segment_count']} regroup_actions={summary['regroup_action_total']}"
-            )
-        else:
-            if not hasattr(pbar, "_rs"):
-                pbar._rs = 0.0
-                pbar._rn = 0
-            pbar._rs += reward_margin
-            pbar._rn += 1
-            rolling_rwd = pbar._rs / pbar._rn
-            pbar.set_description(f"RwØ {rolling_rwd:+.3f} | Steps {summary['steps']}")
-            pbar.update(1)
-
         logger.record_episode_summary(summary)
 
+        if episode_number % diagnostics_every == 0 or ep == args.episodes - 1:
+            avg_return = sum(window_returns) / max(1, window_episodes)
+            win_rate_pct = 100.0 * window_wins / max(1, window_episodes)
+            champion_wins_display = str(last_tournament["champion_wins"]) if last_tournament is not None else "-"
+            print(
+                f"[Episode {episode_number}] Avg Return: {avg_return:+.3f} | Win Rate: {win_rate_pct:.1f}% | "
+                f"Policy Loss: {last_losses['policy']:.4f} | Value Loss: {last_losses['value']:.4f} | "
+                f"Champion Wins: {champion_wins_display}"
+            )
+            window_returns = []
+            window_wins = 0.0
+            window_episodes = 0
+
+        # ── Persist candidate checkpoints ──
         latest_payload = {
             "model_state_dict": policy.net.state_dict(),
             "optimizer_state_dict": policy.optimizer.state_dict(),
             "episode": episode_number,
-            "decks": deck_meta,
+            "obs_size": policy.obs_size,
+            "max_actions": policy.max_actions,
             "checkpoint_source": args.checkpoint,
         }
+        torch.save(policy.net.state_dict(), os.path.join(log_dir, "policy_latest.pt"))
+        torch.save(latest_payload, os.path.join(log_dir, "policy_latest.ckpt"))
 
-        torch.save(policy.net.state_dict(), f"{args.log_dir}/policy_latest.pt")
-        torch.save(latest_payload, f"{args.log_dir}/policy_latest.ckpt")
-
-        if args.checkpoint_every > 0 and (episode_number % args.checkpoint_every == 0):
-            torch.save(policy.net.state_dict(), f"{args.log_dir}/policy_ep{episode_number}.pt")
-            torch.save(
-                latest_payload,
-                f"{args.log_dir}/policy_ep{episode_number}.ckpt",
-            )
-
-    # Write best / worst episode tracking to JSON
-    import json as _json
-    _tracking = {
-        "best_episodes_by_margin": best_episodes,
-        "worst_episodes_by_margin": worst_episodes,
-        "total_episodes": start_episode + args.episodes,
-    }
-    with open(os.path.join(args.log_dir, "best_worst_episodes.json"), "w", encoding="utf-8") as _f:
-        _json.dump(_tracking, _f, indent=2, default=str)
-
+    board.close()
     logger.close()
+    if verbose:
+        print(f"Training finished. Champion file: {champion_path} (promotions: {promotions})")
 
 
 if __name__ == "__main__":
     main()
+
