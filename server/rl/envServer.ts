@@ -280,7 +280,7 @@ function getState() {
     };
 }
 
-const PORT = 3005;
+const PORT = Number(process.env.PORT) || Number(process.argv[2]) || 3005;
 app.listen(PORT, () => {
     console.log(`RL Env Server listening on port ${PORT}`);
 });

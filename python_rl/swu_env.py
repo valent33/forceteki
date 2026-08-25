@@ -4,12 +4,13 @@ import json
 import os
 import re
 import warnings
-from collections import Counter
+from collections import Counter, deque
 from typing import Any
 
 import gymnasium as gym
 import numpy as np
 import requests
+import sys as _sys
 from gymnasium import spaces
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -144,6 +145,11 @@ class SWUEnv(gym.Env):
         self.max_action_space = 100
         self.action_space = spaces.Discrete(self.max_action_space)
 
+        # Some prompts list every card in the game (e.g. "Choose an option from
+        # the list" → a dropdown with 1700+ card names). Cap dropdown fan-out so
+        # the flat action list can never exceed the fixed policy-head size.
+        self.max_dropdown_actions = 48
+
         # The observation is a structured, feature-complete State Tensor.
         # Exact layout is documented in `_get_obs()` and the module-level
         # block constants (OBS_DIM = 2386 floats).
@@ -162,6 +168,18 @@ class SWUEnv(gym.Env):
         self._consumed_card_uuids: set[str] = set()
         self._last_prompt_key: str | None = None
         self._last_prompt_sig: str | None = None
+        # No-progress loop breaker (see `_track_loop_repeat`): actions that get
+        # retried from an identical (prompt, board) state are masked until the
+        # prompt changes, so a saturated policy can't spin in play→Cancel cycles.
+        self._loop_blocks: dict[str, tuple[str, str]] = {}
+        self._step_history: deque[tuple] = deque(maxlen=8)
+        self._loop_block_print_budget = 3
+        # True when the most recent env.step() left the game state unchanged
+        # (server did not accept the action) — consumed by the trainer to log
+        # illegal actions with the server payload.
+        self._last_step_no_progress = False
+        # Gates the one-time [ENV] number-prompt debug dump per prompt instance.
+        self._last_number_dump_sig: tuple | None = None
         # Deck definitions (internal names) captured from the /reset payload —
         # used to build the opponent info-set densities in Block 4.
         self._deck_definitions: dict[str, Counter] = {"player1": Counter(), "player2": Counter()}
@@ -193,6 +211,10 @@ class SWUEnv(gym.Env):
         if "error" in self.current_state:
             raise RuntimeError(f"Error from server on reset: {self.current_state['error']}")
 
+        # Fresh game → fresh loop-detection history.
+        self._loop_blocks.clear()
+        self._step_history.clear()
+        self._loop_block_print_budget = 3
         self._update_available_actions()
         return self._get_obs(), self._get_info()
 
@@ -217,6 +239,8 @@ class SWUEnv(gym.Env):
 
         prev_state = copy.deepcopy(self.current_state)
         action_dict = self.available_actions[action_index]
+        self._track_loop_repeat(action_dict)
+        prev_progress_sig = self._state_progress_sig(prev_state)
         # Some prompts require structured results rather than a simple click.
         if action_dict.get("actionType") == "statefulPromptResults":
             payload = {
@@ -266,6 +290,7 @@ class SWUEnv(gym.Env):
 
                 self._update_available_actions()
 
+            self._last_step_no_progress = prev_progress_sig == self._state_progress_sig(self.current_state)
             return self._get_obs(), reward, terminated, truncated, self._get_info()
 
         if action_dict["actionType"] == "macro_resource_cards":
@@ -422,6 +447,7 @@ class SWUEnv(gym.Env):
 
             self._update_available_actions()
 
+        self._last_step_no_progress = prev_progress_sig == self._state_progress_sig(self.current_state)
         return self._get_obs(), reward, terminated, truncated, self._get_info()
 
     def _update_available_actions(self):
@@ -430,17 +456,11 @@ class SWUEnv(gym.Env):
         into a flat list of valid actions, and constructs a binary
         `legal_action_mask` for dynamic action masking.
 
-        Masking rules (applied in `_apply_dynamic_action_masking`):
-          1. Positive stat buffs / shields / friendly upgrades → mask = 0 on
-             enemy targets.
-          2. Damage / negative modifiers / defeat effects → mask = 0 on
-             friendly targets (unless no enemy targets exist or self-sacrifice
-             is forced).
-          3. Arena enforcement: space units cannot attack ground targets and
-             vice versa.
-          4. Sentinel enforcement: if the opponent has a Ready Sentinel unit in
-             an arena, attacks on non-Sentinel targets in that arena are masked
-             unless the attacker has Saboteur.
+        The server is the single source of legality truth: `selectableCards` is
+        engine-filtered (illegal targets such as Sentinel-guarded units are
+        absent), buttons carry `disabled` flags, and `debug_legalActions`
+        reports per-card requirement results. The env only builds actions from
+        that data; the mask applies empirical no-progress loop blocks only.
 
         Returns
         -------
@@ -478,7 +498,7 @@ class SWUEnv(gym.Env):
                     if not isinstance(card, dict):
                         continue
                     selection_state = str(card.get("selectionState", "")).lower()
-                    if selection_state not in {"viewonly", "invalid"}:
+                    if selection_state not in {"viewonly", "invalid", "unselectable"}:
                         return True
 
                 return False
@@ -570,11 +590,13 @@ class SWUEnv(gym.Env):
         # ── DEBUG: log when we enter action building with a number prompt ──
         menu_lower = menu_title.lower()
         if "choose a number" in menu_lower or "choose number" in menu_lower:
-            import sys as _sys
-            _sys.stderr.write(f"[ENV] number-prompt p_key={p_key} p_id={p_id} "
-                              f"menu={menu_title!r} buttons={len(player_prompt.get('buttons',[]))} "
-                              f"keys={sorted(player_prompt.keys())!r}\n")
-            _sys.stderr.flush()
+            dump_sig = (p_key, str(player_prompt.get("promptUuid", "")))
+            if dump_sig != getattr(self, "_last_number_dump_sig", None):
+                self._last_number_dump_sig = dump_sig
+                _sys.stderr.write(f"[ENV] number-prompt p_key={p_key} p_id={p_id} "
+                                  f"menu={menu_title!r} buttons={len(player_prompt.get('buttons',[]))} "
+                                  f"keys={sorted(player_prompt.keys())!r}\n")
+                _sys.stderr.flush()
 
         has_buttons = "buttons" in player_prompt and len(player_prompt["buttons"]) > 0
         has_dropdowns = "dropdownListOptions" in player_prompt and len(player_prompt["dropdownListOptions"]) > 0
@@ -594,6 +616,11 @@ class SWUEnv(gym.Env):
                     if not btn.get("disabled", False):
                         btn_arg = str(btn.get("arg", "")).strip().lower()
                         btn_text = str(btn.get("text", "")).strip().lower()
+                        # Cancel is a zero-progress no-op: never offer it. If the
+                        # agent picked a cancellable action it must commit to it
+                        # (or pick something else) instead of undoing it.
+                        if "cancel" in btn_arg or "cancel" in btn_text:
+                            continue
                         # structured numeric features for the policy
                         features = {
                             "is_stateful": 0.0,
@@ -623,7 +650,11 @@ class SWUEnv(gym.Env):
                         })
 
             if has_dropdowns:
-                for option in player_prompt["dropdownListOptions"]:
+                dropdown_options = list(player_prompt["dropdownListOptions"])
+                # Reserve headroom for buttons / card actions and cap the fan-out.
+                dropdown_cap = max(1, min(self.max_dropdown_actions, self.max_action_space - len(self.available_actions) - 4))
+                dropdown_options = dropdown_options[:dropdown_cap]
+                for option in dropdown_options:
                     features = {
                         "is_stateful": 0.0,
                         "is_macro": 0.0,
@@ -656,49 +687,22 @@ class SWUEnv(gym.Env):
                 my_state = self.current_state["state"][p_key]
                 import itertools
 
-                # Add the base 'Done' button if valid.
-                for btn in player_prompt.get("buttons", []):
-                    if btn.get("arg") == "done" and not btn.get("disabled", False):
-                        self.available_actions.append({
-                            "playerId": p_id,
-                            "actionType": "clickPrompt",
-                            "arg": btn.get("arg"),
-                            "uuid": btn.get("uuid", ""),
-                            "method": btn.get("command"),
-                            "promptText": btn.get("text")
-                        })
-
                 # Resourceing can only use the controlled player's hand.
-                hand_cards = my_state.get("hand", [])
-                if "2 cards" in menu_title:
-                    for pair in itertools.combinations(hand_cards, 2):
-                        features = {
-                            "is_stateful": 0.0,
-                            "is_macro": 1.0,
-                            "is_dropdown": 0.0,
-                            "is_done": 0.0,
-                            "is_claim": 0.0,
-                            "is_pass": 0.0,
-                            "is_card": 0.0,
-                            "is_friendly": 1.0,
-                            "is_leader": 0.0,
-                            "is_base": 0.0,
-                            "is_exhausted": 0.0,
-                            "is_unit": 0.0,
-                            "card_power": 0.0,
-                            "card_hp": 0.0,
-                        }
-                        self.available_actions.append({
-                            "playerId": p_id,
-                            "actionType": "macro_resource_cards",
-                            "uuids": [pair[0]["uuid"], pair[1]["uuid"]],
-                            "arg": "any",
-                            "internalName": f"{pair[0].get('internalName', 'Unknown')} + {pair[1].get('internalName', 'Unknown')}",
-                            "features": features,
-                        })
+                #   Setup:   "Select 2 cards to resource"           → every pair.
+                #   Regroup: "Select between 0 and N cards to resource" → single
+                #            cards (0 = the "Skip Resourcing" button, which the
+                #            regular button loop above adds when enabled).
+                hand_cards = [c for c in my_state.get("hand", []) if c.get("uuid")]
+                if "between" in menu_title:
+                    card_groups = [(card,) for card in hand_cards]
+                elif "2 cards" in menu_title:
+                    card_groups = list(itertools.combinations(hand_cards, 2))
                 else:
-                    for card in hand_cards:
-                        # normalize: power / 10, hp / 20
+                    card_groups = [(card,) for card in hand_cards]
+
+                for group in card_groups:
+                    if len(group) == 1:
+                        card = group[0]
                         power_val = float(card.get("power") or card.get("printedPower") or 0.0)
                         hp_val = float(card.get("hp") or card.get("remainingHp") or card.get("currentHp") or 0.0)
                         features = {
@@ -723,6 +727,31 @@ class SWUEnv(gym.Env):
                             "uuids": [card["uuid"]],
                             "arg": "any",
                             "internalName": card.get("internalName", "Unknown"),
+                            "features": features,
+                        })
+                    else:
+                        features = {
+                            "is_stateful": 0.0,
+                            "is_macro": 1.0,
+                            "is_dropdown": 0.0,
+                            "is_done": 0.0,
+                            "is_claim": 0.0,
+                            "is_pass": 0.0,
+                            "is_card": 0.0,
+                            "is_friendly": 1.0,
+                            "is_leader": 0.0,
+                            "is_base": 0.0,
+                            "is_exhausted": 0.0,
+                            "is_unit": 0.0,
+                            "card_power": 0.0,
+                            "card_hp": 0.0,
+                        }
+                        self.available_actions.append({
+                            "playerId": p_id,
+                            "actionType": "macro_resource_cards",
+                            "uuids": [group[0]["uuid"], group[1]["uuid"]],
+                            "arg": "any",
+                            "internalName": f"{group[0].get('internalName', 'Unknown')} + {group[1].get('internalName', 'Unknown')}",
                             "features": features,
                         })
             elif (len(selectable_uuids) > 0 or len(display_cards) > 0) and self.current_state.get("state") and p_key in self.current_state["state"] and not is_stateful_distribution_prompt:
@@ -879,7 +908,10 @@ class SWUEnv(gym.Env):
                         continue
 
                     selection_state = str(display_card.get("selectionState", "")).lower()
-                    if selection_state in {"viewonly", "invalid"}:
+                    # `unselectable` cards (e.g. L3-37 droids that would exceed
+                    # the combined cost) are shown but NOT clickable — the
+                    # server ignores clicks on them.
+                    if selection_state in {"viewonly", "invalid", "unselectable"}:
                         continue
 
                     display_uuid = display_card.get("cardUuid") or display_card.get("uuid")
@@ -998,6 +1030,8 @@ class SWUEnv(gym.Env):
                             "dropdown_count": len(player_prompt.get("dropdownListOptions", [])),
                             "selectableCards_count": len(player_prompt.get("selectableCards", [])),
                             "displayCards_count": len(player_prompt.get("displayCards") or []),
+                            "selectNumber_data": str(player_prompt.get("selectNumber", "MISSING"))[:500],
+                            "prompt_title": str(player_prompt.get("promptTitle", "MISSING"))[:200],
                             "chooseNumber_data": str(player_prompt.get("chooseNumber", "MISSING"))[:500],
                             "chooseAmount_data": str(player_prompt.get("chooseAmount", "MISSING"))[:500],
                         }, _f, indent=2, default=str)
@@ -1005,32 +1039,71 @@ class SWUEnv(gym.Env):
                     pass
 
             # ── Try every known way to answer a NumberPrompt ────────
-            # 1) statefulPromptResults with the correct data key
+            # NumberPrompt is answered with a menuButton whose `arg` is the
+            # chosen integer (server asserts min <= arg <= max). It does NOT
+            # support statefulPromptResults — sending that crashes the server
+            # contract ("Attempting to trigger onStatefulPromptResults ... not
+            # supported by the current step").
             choose_key = None
-            for k in ("chooseNumber", "chooseAmount", "selectNumber"):
+            for k in ("selectNumber", "chooseNumber", "chooseAmount"):
                 if k in player_prompt:
                     choose_key = k
                     break
             if not choose_key and prompt_type in ("chooseNumber", "chooseAmount", "number"):
-                choose_key = prompt_type
+                choose_key = "selectNumber"
             if choose_key:
                 choose_data = player_prompt.get(choose_key) or {}
-                # NumberPrompt data: { min, max, value } or { minimum, maximum, amount }
-                val = int(choose_data.get("value") or choose_data.get("amount") or
-                          choose_data.get("min") or choose_data.get("minimum") or 0)
-                self.available_actions.append({
-                    "playerId": p_id,
-                    "actionType": "statefulPromptResults",
-                    "uuid": player_prompt.get("promptUuid", ""),
-                    "result": {"type": choose_key, "value": val},
-                    "promptText": menu_title,
-                    "internalName": f"numberPrompt {val}",
-                })
+                if not isinstance(choose_data, dict):
+                    choose_data = {}
+                minimum = choose_data.get("min", choose_data.get("minimum"))
+                maximum = choose_data.get("max", choose_data.get("maximum"))
+                default = choose_data.get("value", choose_data.get("amount"))
+                try:
+                    lo = int(minimum)
+                    hi = int(maximum)
+                except (TypeError, ValueError):
+                    lo, hi = None, None
+                if lo is not None and hi is not None and hi >= lo:
+                    # Offer the full choice range (capped at 12) so the policy
+                    # can pick meaningfully instead of always answering the
+                    # default/min value.
+                    values = list(range(lo, hi + 1))[:12]
+                    for val in values:
+                        self.available_actions.append({
+                            "playerId": p_id,
+                            # `action: menuButton` is routed by envServer.ts straight to
+                            # game.menuButton(arg, uuid). NumberPrompt serializes NO buttons,
+                            # so a `clickPrompt` would fail the button lookup and return 500.
+                            "actionType": "menuButton",
+                            "arg": str(val),
+                            "uuid": player_prompt.get("promptUuid", ""),
+                            "method": "menuButton",
+                            "promptText": f"{menu_title}: {val}",
+                            "internalName": f"numberPrompt {val}",
+                            "features": {
+                                "is_stateful": 1.0,
+                                "is_macro": 0.0,
+                                "is_dropdown": 0.0,
+                                "is_done": 0.0,
+                                "is_claim": 0.0,
+                                "is_pass": 0.0,
+                                "is_card": 0.0,
+                                "is_friendly": 0.0,
+                                "is_leader": 0.0,
+                                "is_base": 0.0,
+                                "is_exhausted": 0.0,
+                                "is_unit": 0.0,
+                                "card_power": 0.0,
+                                "card_hp": 0.0,
+                            },
+                        })
 
             # 2) Any non‑disabled button (many NumberPrompts have +/-/Done)
             if len(self.available_actions) == 0:
                 for btn in player_prompt.get("buttons", []):
                     if not btn.get("disabled", False):
+                        if "cancel" in str(btn.get("arg", "")).lower() or "cancel" in str(btn.get("text", "")).lower():
+                            continue
                         self.available_actions.append({
                             "playerId": p_id,
                             "actionType": "clickPrompt",
@@ -1041,9 +1114,15 @@ class SWUEnv(gym.Env):
                         })
                         break
 
-            # 3) Desperate: ANY button, even disabled
+            # 3) Desperate: any remaining non-disabled button.
+            #    (Never click DISABLED buttons — that just loops forever, e.g. the
+            #    setup "Confirm Resources" button before 2 cards are selected.)
             if len(self.available_actions) == 0:
                 for btn in player_prompt.get("buttons", []):
+                    if btn.get("disabled", False):
+                        continue
+                    if "cancel" in str(btn.get("arg", "")).lower() or "cancel" in str(btn.get("text", "")).lower():
+                        continue
                     self.available_actions.append({
                         "playerId": p_id,
                         "actionType": "clickPrompt",
@@ -1054,16 +1133,17 @@ class SWUEnv(gym.Env):
                     })
                     break
 
-            # 4) Absolute last resort: raw "Done" click with promptUuid
-            if len(self.available_actions) == 0:
-                self.available_actions.append({
-                    "playerId": p_id,
-                    "actionType": "clickPrompt",
-                    "arg": "done",
-                    "uuid": player_prompt.get("promptUuid", ""),
-                    "method": "menuButton",
-                    "promptText": "Done",
-                })
+            # 4) Absolute last resort: deliberately build NOTHING. Inventing a
+            #    raw "Done" menuButton for an unknown prompt hits the server's
+            #    contract assertion ("...not supported by the current step") and
+            #    corrupts the game. Zero actions lets the caller poll and abort
+            #    the episode via the stall guard instead of crashing the server.
+
+        # ── Hard safety cap ──────────────────────────────────────────────────
+        # The policy head has exactly `max_action_space` slots, so the flat
+        # action list (and the mask built from it) must never exceed that.
+        if len(self.available_actions) > self.max_action_space:
+            self.available_actions = self.available_actions[:self.max_action_space]
 
         # ── Dynamic action masking: mark which of these actions the policy may take ──
         self._apply_dynamic_action_masking(player_prompt, p_key)
@@ -1305,164 +1385,161 @@ class SWUEnv(gym.Env):
     # ──────────────────────────────────────────────────────────────────────────
     CARD_ACTION_TYPES = ("clickCard", "displayCardClick", "perCardMenuButton", "macro_resource_cards")
 
-    def _classify_prompt_intent(self, player_prompt: dict[str, Any] | None) -> dict[str, bool]:
-        """Heuristically classify what the current prompt is asking for."""
-        title = str((player_prompt or {}).get("menuTitle") or "").lower()
-        prompt_type = str((player_prompt or {}).get("promptType") or "").lower()
-
-        intent = {
-            "is_attack": False,
-            "is_attack_with": False,   # selecting the attacker itself
-            "is_damage": False,
-            "is_defeat": False,
-            "is_shield": False,
-            "is_upgrade": False,
-            "is_buff": False,
-            "is_negative": False,
-            "is_positive": False,
-        }
-        if "attack" in title:
-            intent["is_attack"] = True
-            intent["is_attack_with"] = "with" in title
-        if prompt_type == "distributeamongtargets" or "damage" in title or "deal" in title:
-            intent["is_damage"] = True
-        if "defeat" in title or "destroy" in title:
-            intent["is_defeat"] = True
-        if "shield" in title:
-            intent["is_shield"] = True
-        if "attach" in title and "upgrade" in title:
-            intent["is_upgrade"] = True
-        if (re.search(r"\+[0-9]", title) or "increase" in title or "gain" in title
-                or "restore" in title or "heal" in title):
-            intent["is_buff"] = True
-        # Negative-modifier prompts ("-2/-2") must not be classified as buffs.
-        if intent["is_damage"] or intent["is_defeat"] or re.search(r"-\d", title):
-            intent["is_buff"] = False
-        if any(token in title for token in ("return to hand", "discard", "to exhaust", "capture", "take control")):
-            intent["is_negative"] = True
-        intent["is_negative"] = intent["is_negative"] or intent["is_damage"] or intent["is_defeat"]
-        intent["is_positive"] = intent["is_shield"] or intent["is_upgrade"] or intent["is_buff"]
-        return intent
-
-    def _find_card_in_play(self, uuid: str) -> dict[str, Any] | None:
-        state_section = (self.current_state or {}).get("state") or {}
-        for seat in ("player1", "player2"):
-            player_state = state_section.get(seat) or {}
-            for zone_key in ("spaceArena", "groundArena", "hand"):
-                for card in player_state.get(zone_key) or []:
-                    if str(card.get("uuid")) == uuid:
-                        return card
-            for special in ("leader", "base"):
-                card = player_state.get(special)
-                if isinstance(card, dict) and str(card.get("uuid")) == uuid:
-                    return card
-        return None
-
-    def _resolve_attacker(self, player_prompt: dict[str, Any] | None, p_key: str) -> dict[str, Any] | None:
-        """Find the unit making the attack for an attack-target prompt."""
-        if self._pending_attacker_uuid:
-            card = self._find_card_in_play(self._pending_attacker_uuid)
-            if isinstance(card, dict):
-                return card
-        title = str((player_prompt or {}).get("menuTitle") or "").lower()
-        state_section = (self.current_state or {}).get("state") or {}
-        my_state = state_section.get(p_key) or {}
-        candidates: list[dict[str, Any]] = []
-        for zone_key in ("spaceArena", "groundArena"):
-            candidates.extend(my_state.get(zone_key) or [])
-        leader = my_state.get("leader")
-        if isinstance(leader, dict) and self._zone_name(leader) in ("ground", "space"):
-            candidates.append(leader)
-        for card in candidates:
-            db = self._card_data(card.get("internalName"))
-            card_title = str(db.get("title") or "").lower()
-            if len(card_title) >= 5 and card_title in title:
-                return card
-        return None
-
-    def _ready_enemy_sentinels(self, p_key: str) -> dict[str, float]:
-        sentinels = {"ground": 0.0, "space": 0.0}
-        opp_key = "player2" if p_key == "player1" else "player1"
-        state_section = (self.current_state or {}).get("state") or {}
-        opp_state = state_section.get(opp_key) or {}
-        for arena, zone_key in (("ground", "groundArena"), ("space", "spaceArena")):
-            for card in opp_state.get(zone_key) or []:
-                if self._is_exhausted(card):
-                    continue
-                if self._keyword_flags(self._card_data(card.get("internalName"))).get("sentinel"):
-                    sentinels[arena] += 1.0
-        leader = opp_state.get("leader")
-        if isinstance(leader, dict) and not self._is_exhausted(leader):
-            zone = self._zone_name(leader)
-            if zone in sentinels and self._keyword_flags(self._card_data(leader.get("internalName"))).get("sentinel"):
-                sentinels[zone] += 1.0
-        return sentinels
-
-    def _attack_target_allowed(self, attacker: dict[str, Any], meta: dict[str, Any], p_key: str) -> bool:
-        """Arena + Sentinel legality for one attack-target action."""
-        attacker_zone = self._zone_name(attacker)
-        target_zone = meta.get("targetZone")
-        # Bases can be attacked from either arena.
-        if target_zone == "base":
-            return True
-        if target_zone not in ("ground", "space") or attacker_zone is None:
-            return True
-        # Space units cannot attack ground targets, and vice versa.
-        if attacker_zone in ("ground", "space") and attacker_zone != target_zone:
-            return False
-        attacker_keywords = self._keyword_flags(self._card_data(attacker.get("internalName")))
-        if attacker_keywords.get("saboteur"):
-            return True
-        if meta.get("targetIsSentinel"):
-            return True
-        sentinels = self._ready_enemy_sentinels(p_key)
-        return float(sentinels.get(target_zone, 0.0)) <= 0.0
-
     def _apply_dynamic_action_masking(self, player_prompt: dict[str, Any] | None, p_key: str) -> np.ndarray:
-        """Build the binary legal_action_mask for the current action list."""
-        actions = self.available_actions
+        """Build the binary legal_action_mask for the current action list.
+
+        The server is the single source of legality truth and its data is
+        consumed at build time: `selectableCards` is engine-filtered (verified
+        against recorded games — illegal attack targets such as Sentinel-guarded
+        units are absent from the list), and disabled buttons are skipped.
+        This mask therefore reimplements NO game rules; it only applies the
+        empirical no-progress loop blocks from `_track_loop_repeat`.
+        """
+        actions = self.available_actions[:self.max_action_space]
         n = len(actions)
-        mask = np.zeros(max(self.max_action_space, n), dtype=np.int8)
+        mask = np.zeros(self.max_action_space, dtype=np.int8)
         if n == 0:
             self.legal_action_mask = mask
             return mask
 
-        intent = self._classify_prompt_intent(player_prompt)
-
-        enemy_target_exists = any(
-            (action.get("meta") or {}).get("targetOwner") == "enemy"
-            for action in actions if action.get("actionType") in self.CARD_ACTION_TYPES
-        )
-
-        is_target_prompt = intent["is_attack"] and not intent["is_attack_with"]
-        attacker = self._resolve_attacker(player_prompt, p_key) if is_target_prompt else None
+        # Actions blocked by no-progress loop detection while this exact prompt
+        # is open (see `_track_loop_repeat`).
+        current_prompt_sig = (p_key, str((player_prompt or {}).get("menuTitle", "")))
+        blocked_keys = {key for key, sig in self._loop_blocks.items() if sig == current_prompt_sig}
 
         for index, action in enumerate(actions):
-            allowed = True
-            meta = action.get("meta") or {}
-            owner = meta.get("targetOwner")
-            if action.get("actionType") in self.CARD_ACTION_TYPES and owner:
-                # 1) Positive stat buffs / shields / friendly upgrades → enemy targets masked.
-                if intent["is_positive"] and owner == "enemy":
-                    allowed = False
-                # 2) Damage / negative modifiers / defeat → friendly targets masked,
-                #    unless no enemy targets exist (self-sacrifice fallback).
-                if intent["is_negative"] and owner == "me" and enemy_target_exists:
-                    allowed = False
-                # 3) + 4) Attack prompts: arena enforcement and Sentinel enforcement.
-                if is_target_prompt:
-                    if owner == "enemy":
-                        allowed = self._attack_target_allowed(attacker, meta, p_key) if attacker else True
-                    else:
-                        allowed = not enemy_target_exists
-            if allowed:
-                mask[index] = 1
+            if self._action_key(action) in blocked_keys:
+                continue
+            mask[index] = 1
 
         # Safety valve: never leave an active prompt with zero legal actions.
         if int(mask.sum()) == 0:
             mask[:n] = 1
         self.legal_action_mask = mask
         return mask
+
+    # ── No-progress loop breaker ─────────────────────────────────────────────
+    @staticmethod
+    def _action_key(action: dict[str, Any]) -> str:
+        """Compact identity of an action (deliberately ignores prompt uuids,
+        which the server regenerates on every prompt re-issue)."""
+        action_type = str(action.get("actionType") or "")
+        if action_type == "clickPrompt":
+            return f"clickPrompt:{action.get('arg')}:{action.get('promptText')}"
+        if action_type == "clickCard":
+            return f"clickCard:{action.get('uuid')}"
+        if action_type == "perCardMenuButton":
+            # Include the target card: ordering prompts (e.g. Qui-Gon's "Put on
+            # top") share one arg for every card, and clicking a DIFFERENT card
+            # is legitimate progress, not a loop.
+            return f"perCardMenuButton:{action.get('arg')}:{action.get('cardUuid')}"
+        if action_type == "menuButton":
+            return f"menuButton:{action.get('arg')}:{action.get('promptText')}"
+        if action_type == "macro_resource_cards":
+            return f"macro:{tuple(action.get('uuids') or ())}"
+        return f"{action_type}:{action.get('arg')}:{action.get('uuid')}"
+
+    def _player_state_sig(self, state: dict[str, Any] | None, p_id: str) -> str:
+        """Compact signature of BOTH players' boards (units, bases, economy).
+
+        Includes per-unit exhaustion and damage so that legal progress — e.g.
+        attacking the same target twice — changes the signature and is not
+        mistaken for a no-progress loop."""
+        if not state:
+            return ""
+        parts: list[str] = []
+        for p_key in ("player1", "player2"):
+            sec = (state.get("state") or {}).get(p_key) or {}
+            hand = tuple(sorted(str(c.get("uuid", "")) for c in sec.get("hand", []) if c.get("uuid")))
+            zones = tuple(sorted(
+                (
+                    str(c.get("uuid", "")),
+                    1 if (c.get("exhausted") or c.get("isExhausted")) else 0,
+                    int(c.get("damage") or 0),
+                )
+                for zone in ("spaceArena", "groundArena")
+                for c in sec.get(zone, []) if c.get("uuid")
+            ))
+            base = sec.get("base") or {}
+            leader = sec.get("leader") or {}
+            parts.append(f"{hand}|{zones}|{sec.get('credits')}|{sec.get('readyResources')}|{base.get('hp')}|{leader.get('hp')}")
+        return " || ".join(parts)
+
+    def _state_progress_sig(self, state: dict[str, Any] | None) -> str:
+        """Signature of prompts + board, used to detect steps the server did
+        not accept (identical before/after state). Includes buttons and
+        display-card selection states, since ordering / trigger-order / deck
+        prompts often change ONLY those between steps."""
+        if not state:
+            return ""
+        prompt_parts: list[tuple] = []
+        for seat in ("player1", "player2"):
+            prompt = (state.get("prompts") or {}).get(seat) or {}
+            buttons = tuple(sorted(
+                (str(b.get("text")), str(b.get("arg")), bool(b.get("disabled")))
+                for b in (prompt.get("buttons") or [])
+            ))
+            displays = tuple(sorted(
+                (str(d.get("cardUuid") or d.get("uuid")), str(d.get("selectionState", "")))
+                for d in (prompt.get("displayCards") or []) if isinstance(d, dict)
+            ))
+            per_card = tuple(sorted(
+                (str(b.get("text")), str(b.get("arg")))
+                for b in (prompt.get("perCardButtons") or [])
+            ))
+            prompt_parts.append((
+                seat,
+                str(prompt.get("menuTitle", "")),
+                tuple(sorted(str(u) for u in (prompt.get("selectableCards") or []))),
+                tuple(sorted(str(u) for u in (prompt.get("selectedCards") or []))),
+                buttons,
+                displays,
+                per_card,
+            ))
+        board = self._player_state_sig(state, str(state.get("player1Id") or ""))
+        return f"{prompt_parts} || {board}"
+
+    def _track_loop_repeat(self, action: dict[str, Any]) -> None:
+        """Detect zero-progress action cycles and block the repeating action.
+
+        A saturated policy can lock into e.g. click card → Cancel payment →
+        click card → Cancel ... forever: every step costs -0.01, the state
+        never changes, and the policy gradient dies (entropy 0, policy loss 0).
+        If the same action is retried from an identical (prompt, board) state
+        within the recent history, it is masked until the prompt moves on.
+        """
+        if not isinstance(action, dict) or not self.current_state:
+            return
+        state = self.current_state
+        p_id = str(action.get("playerId") or "")
+        if str(state.get("player1Id")) == p_id:
+            p_key = "player1"
+        elif str(state.get("player2Id")) == p_id:
+            p_key = "player2"
+        else:
+            return
+        prompt = (state.get("prompts") or {}).get(p_key) or {}
+        menu_title = str(prompt.get("menuTitle", ""))
+        if not menu_title or "waiting for opponent" in menu_title.lower():
+            return
+        selected = tuple(sorted(str(u) for u in prompt.get("selectedCards", [])))
+        prompt_sig = (p_key, menu_title, selected)
+        player_sig = self._player_state_sig(state, p_id)
+        triple = (prompt_sig, player_sig, self._action_key(action))
+
+        if triple in self._step_history:
+            key = triple[2]
+            if self._loop_blocks.get(key) != prompt_sig[:2]:
+                self._loop_blocks[key] = prompt_sig[:2]
+                if self._loop_block_print_budget > 0:
+                    self._loop_block_print_budget -= 1
+                    _sys.stderr.write(
+                        f"[ENV] loop-block: masking {key!r} under {menu_title!r} "
+                        f"(same no-progress step seen twice)\n"
+                    )
+                    _sys.stderr.flush()
+            return
+        self._step_history.append(triple)
 
     def _get_obs(self):
         """
@@ -1794,6 +1871,7 @@ class SWUEnv(gym.Env):
         return {
             "phase": self.current_state.get("phase") if self.current_state else None,
             "activePlayer": self.active_player,
+            "no_progress": bool(getattr(self, "_last_step_no_progress", False)),
             "activePlayers": self.active_players,
             "activePrompts": active_prompts,
             "num_valid_actions": len(self.available_actions),
@@ -2061,7 +2139,7 @@ class SWUEnv(gym.Env):
             wasted = prev_ready + 0.5 * prev_credits
             waste_frac = wasted / max(1.0, total_capacity) if total_capacity > 0 else 0.0
             if waste_frac > 0.1:
-                reward -= min(0.8, waste_frac * 1.0)
+                reward -= min(1.0, waste_frac * 1.2)
             # Count unexhausted (ready) units on the agent's board.
             curr_player_state = self._safe_state_player(current_state, curr_key)
             unexhausted = 0.0
@@ -2070,12 +2148,13 @@ class SWUEnv(gym.Env):
                     if not (card.get("exhausted") or card.get("isExhausted") or card.get("is_exhausted")):
                         unexhausted += 1.0
             if unexhausted > 0:
-                reward -= min(1.0, 0.2 * unexhausted)
+                reward -= min(1.2, 0.3 * unexhausted)
             # Extra penalty for plain "Pass" vs "Claim initiative" — passing gives
-            # the opponent a free turn without gaining initiative.
+            # the opponent a free turn without gaining initiative. Passing is
+            # almost always the worst action, so make it clearly expensive.
             is_claim = "claim" in full_text
             if not is_claim:
-                reward -= 0.15
+                reward -= 0.5
 
         return reward
 

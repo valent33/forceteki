@@ -353,7 +353,16 @@ export abstract class GameSystem<TContext extends AbilityContext = AbilityContex
     protected targets(context: TContext, additionalProperties: Partial<TProperties> = {}) {
         this.validateContext(context);
 
-        return Helpers.asArray(this.generatePropertiesFromContext(context, additionalProperties).target);
+        try {
+            return Helpers.asArray(this.generatePropertiesFromContext(context, additionalProperties).target);
+        } catch (err) {
+            // Property factories can read state that has since changed (e.g. a
+            // pilot's `parentCard` after its attached unit left play). Treat an
+            // unbuildable target list as "no targets" instead of crashing the
+            // game — same philosophy as `canAffect`.
+            context.game?.reportError(err);
+            return [];
+        }
     }
 
     public toString() {

@@ -19,7 +19,11 @@ export default class IdenVersioAdaptOrDie extends NonLeaderUnitCard {
                 onUpgradeAttached: (event, context) => event.upgradeCard === context.source
             },
             immediateEffect: AbilityHelper.immediateEffects.giveShield((context) => ({
-                target: context.source.parentCard ?? context.source
+                // If the pilot was detached before this queued trigger resolves
+                // (e.g. its attached unit left play), `parentCard` is null and the
+                // getter contract-asserts — so guard with isInPlay() like
+                // PerilousPosition does instead of relying on `??`.
+                target: context.source.isInPlay() ? context.source.parentCard : null
             }))
         });
     }
