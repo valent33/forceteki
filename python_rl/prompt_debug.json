@@ -1,6 +1,6 @@
 {
-  "p_key": "player1",
-  "p_id": "111",
+  "p_key": "player2",
+  "p_id": "222",
   "menu_title": "Choose a number",
   "prompt_keys": [
     "buttons",
@@ -23,6 +23,8 @@
   "dropdown_count": 0,
   "selectableCards_count": 0,
   "displayCards_count": 0,
+  "selectNumber_data": "{'min': 1, 'max': 2}",
+  "prompt_title": "Select amount of Credit tokens",
   "chooseNumber_data": "MISSING",
   "chooseAmount_data": "MISSING"
 }

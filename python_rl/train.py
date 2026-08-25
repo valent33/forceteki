@@ -19,11 +19,13 @@ import argparse
 import copy
 import json
 import os
+import queue
 import random
 import re
 import time
 from typing import Any, Callable
 
+import numpy as np
 import torch
 
 from swu_env import SWUEnv
@@ -246,6 +248,115 @@ def _infer_episode_from_checkpoint_path(checkpoint_path: str) -> int | None:
     return None
 
 
+def _slim_info(info: dict | None) -> dict | None:
+    """Strip the nested full-state copy (`state_dict`) from env info before
+    writing transitions to disk — the caller already stores the state snapshot,
+    so keeping it twice bloats transitions.jsonl massively."""
+    if not isinstance(info, dict):
+        return info
+    return {key: value for key, value in info.items() if key != "state_dict"}
+
+
+def _slim_actions(actions, cap: int = 24) -> dict:
+    """Compact serialisation of an action list for transitions.jsonl.
+
+    Giant prompts (e.g. "Choose an option from the list" listing every card
+    title) used to dump 1700+ full action dicts per transition. Log a count
+    plus the first `cap` slimmed actions — enough to debug, small enough to
+    keep the log usable."""
+    actions = list(actions or [])
+    shown = []
+    for action in actions[:cap]:
+        shown.append({
+            key: action.get(key)
+            for key in ("actionType", "arg", "uuid", "method", "internalName", "promptText", "cardUuid", "uuids")
+            if action.get(key) is not None
+        })
+    return {"count": len(actions), "shown": shown}
+
+
+_BUTTON_ARGS = {"cancel", "pass", "done"}
+
+
+def _bump_action_metrics(metrics: dict, action: dict | None, prompt_title: str = "") -> None:
+    """Count strategic clicks per episode for the console summary.
+
+    In headless mode an attack is NOT a button click: the player clicks their
+    unit in the action window, then clicks an enemy card under the
+    "Choose a target for attack" prompt (InitiateAttackAction). So attacks are
+    counted as clickCard actions on enemy targets while an attack-titled
+    prompt is open."""
+    if not isinstance(action, dict):
+        return
+    action_type = action.get("actionType")
+    title = str(prompt_title or "").lower()
+    if action_type == "clickPrompt":
+        arg = str(action.get("arg") or "").strip().lower()
+        text = str(action.get("promptText") or "").strip().lower()
+        # Buttons often carry numeric args (e.g. Cancel has arg=1 on the
+        # credit-payment prompt); match on the button text too so no-op
+        # cancels are counted instead of vanishing from the summary.
+        if arg in _BUTTON_ARGS:
+            key = f"{arg}_clicks"
+        elif "cancel" in text:
+            key = "cancel_clicks"
+        elif "pass" in text:
+            key = "pass_clicks"
+        elif "done" in text:
+            key = "done_clicks"
+        else:
+            key = None
+        if key:
+            metrics[key] = metrics.get(key, 0) + 1
+        if arg == "attack" or "attack" in text:
+            metrics["attack_clicks"] = metrics.get("attack_clicks", 0) + 1
+    elif action_type == "clickCard" and "attack" in title:
+        # The attacker click happens in the action window (no "attack" in its
+        # title); the defender/base click under the attack prompt is the attack.
+        if (action.get("meta") or {}).get("targetOwner") == "enemy":
+            metrics["attack_clicks"] = metrics.get("attack_clicks", 0) + 1
+
+
+def _log_no_progress(logger, actor: str, step_idx: int, action: dict, env) -> None:
+    """Record a step the server did not accept, with the server's own payload,
+    so mismatches can be reviewed later (see inspect_server.py)."""
+    state = env.current_state or {}
+    p_id = str(action.get("playerId") or "")
+    p_key = "player1" if str(state.get("player1Id")) == p_id else "player2"
+    prompt = (state.get("prompts") or {}).get(p_key) or {}
+    payload = {
+        "menuTitle": prompt.get("menuTitle"),
+        "buttons": [
+            {"text": b.get("text"), "arg": b.get("arg"), "disabled": b.get("disabled")}
+            for b in (prompt.get("buttons") or [])
+        ],
+        "selectableCards": prompt.get("selectableCards"),
+        "selectedCards": prompt.get("selectedCards"),
+        "dropdownListOptions": prompt.get("dropdownListOptions"),
+    }
+    logger.log(
+        f"[no-progress] step={step_idx} actor={actor} prompt={str(prompt.get('menuTitle'))!r} "
+        f"action={_describe_action(action, None)} selectable={len(prompt.get('selectableCards') or [])}",
+        player_id=actor if actor in {"111", "222"} else None,
+    )
+    logger.record_rl_transition({
+        "event": "no_progress_step",
+        "player_id": actor,
+        "step_index": step_idx,
+        "action": action,
+        "server_payload": payload,
+        "available_actions": _slim_actions(env.available_actions),
+    })
+
+
+def _snapshot_policy(policy: TorchPolicy, device: str) -> TorchPolicy:
+    """Clone the candidate's current weights for self-play (detached copy)."""
+    snapshot = TorchPolicy(obs_size=policy.obs_size, max_actions=policy.max_actions, device=device, temperature=policy.temperature)
+    snapshot.net.load_state_dict({key: value.detach().clone() for key, value in policy.net.state_dict().items()})
+    snapshot.net.eval()
+    return snapshot
+
+
 # ── Gated champion pool ──────────────────────────────────────────────────────
 class ChampionPool:
     """
@@ -264,6 +375,7 @@ class ChampionPool:
         max_actions: int,
         device: str,
         champion_probability: float = 0.8,
+        self_play_probability: float = 0.5,
         verbose: bool = True,
     ):
         self.log_dir = log_dir
@@ -273,6 +385,7 @@ class ChampionPool:
         self.max_actions = max_actions
         self.device = device
         self.champion_probability = float(champion_probability)
+        self.self_play_probability = float(self_play_probability)
         self.verbose = verbose
         os.makedirs(self.history_dir, exist_ok=True)
 
@@ -319,11 +432,18 @@ class ChampionPool:
         torch.save(policy.net.state_dict(), path)
         return path
 
-    def sample_opponent(self) -> TorchPolicy | None:
-        """Sample an opponent policy: champion with `champion_probability`,
-        otherwise a random historical checkpoint (falls back to the champion)."""
+    def sample_opponent(self, candidate: TorchPolicy | None = None) -> tuple[TorchPolicy | None, str]:
+        """Sample an opponent policy. Returns (policy, source).
+
+        Sources: 'self' (snapshot of the candidate for self-play), 'champion',
+        'history', or 'random' (no usable pool). Self-play matters: training
+        against a frozen pass-bot champion means the agent never experiences
+        combat or the terminal win/loss signal, so it collapses into passing."""
+        if candidate is not None and random.random() < self.self_play_probability:
+            return _snapshot_policy(candidate, self.device), "self"
+
         if self.has_champion and random.random() < self.champion_probability:
-            return self.champion
+            return self.champion, "champion"
 
         history = sorted(
             name for name in os.listdir(self.history_dir)
@@ -335,13 +455,13 @@ class ChampionPool:
                 snapshot = self._make_policy()
                 try:
                     snapshot.net.load_state_dict(state_dict)
-                    return snapshot
+                    return snapshot, "history"
                 except Exception:
                     pass
 
         if self.has_champion:
-            return self.champion
-        return None
+            return self.champion, "champion"
+        return None, "random"
 
 
 # ── Opponent / action helpers ────────────────────────────────────────────────
@@ -351,10 +471,13 @@ def _policy_action(policy, env) -> int | None:
     if not actions:
         return None
     if isinstance(policy, TorchPolicy):
-        with torch.no_grad():
-            obs_vec = torch.tensor(env._get_obs(), dtype=torch.float32)
-            idx, _, _ = policy.select_action(obs_vec, actions, getattr(env, "legal_action_mask", None))
-        return idx if idx is not None and 0 <= idx < len(actions) else None
+        try:
+            with torch.no_grad():
+                obs_vec = torch.tensor(env._get_obs(), dtype=torch.float32)
+                idx, _, _ = policy.select_action(obs_vec, actions, getattr(env, "legal_action_mask", None))
+            return idx if idx is not None and 0 <= idx < len(actions) else None
+        except Exception:
+            return None
     try:
         return policy.choose_action_index(env)
     except Exception:
@@ -395,7 +518,11 @@ def _resolve_winner(env) -> str | None:
 
 def play_one_game(env, p1_policy, p2_policy, reset_payload: dict, max_steps: int = 1000, stall_polls: int = 40) -> str | None:
     """Run one full episode to completion. Returns winner seat or None."""
-    env.reset(options=reset_payload)
+    try:
+        env.reset(options=reset_payload)
+    except Exception as exc:
+        print(f"  [tournament] reset failed: {exc}")
+        return None
     last_signature = None
     stall_count = 0
 
@@ -438,7 +565,11 @@ def play_one_game(env, p1_policy, p2_policy, reset_payload: dict, max_steps: int
             time.sleep(0.01)
             continue
 
-        _, _, terminated, truncated, _ = env.step(action_index)
+        try:
+            _, _, terminated, truncated, _ = env.step(action_index)
+        except Exception as exc:
+            print(f"  [tournament] step failed: {exc}")
+            return None
         if terminated or truncated:
             break
 
@@ -450,8 +581,8 @@ def run_tournament(
     candidate,
     champion,
     reset_payload_factory: Callable[[], dict],
-    games: int = 50,
-    max_steps: int = 1000,
+    games: int = 100,
+    max_steps: int = 500,
     stall_polls: int = 40,
     verbose: bool = True,
 ) -> dict[str, Any]:
@@ -515,17 +646,429 @@ class MetricsBoard:
             self.writer.close()
 
 
+# ── System perf reporting ────────────────────────────────────────────────────
+def _collect_perf() -> dict:
+    """CPU/RAM of the training process and every running env server process."""
+    perf = {"psutil": False}
+    try:
+        import psutil
+    except ImportError:
+        return perf
+    perf["psutil"] = True
+    me = psutil.Process()
+    perf["python_rss_mb"] = round(me.memory_info().rss / 1e6, 1)
+    try:
+        perf["python_cpu_pct"] = round(me.cpu_percent(interval=0.0), 1)
+    except Exception:
+        perf["python_cpu_pct"] = None
+    servers = []
+    for proc in psutil.process_iter(["pid", "cmdline", "memory_info"]):
+        try:
+            cmd = " ".join(proc.info.get("cmdline") or [])
+            if "envServer.js" in cmd:
+                rss = proc.info.get("memory_info")
+                servers.append({"pid": proc.info.get("pid"), "rss_mb": round((rss.rss if rss else 0) / 1e6, 1)})
+        except Exception:
+            continue
+    perf["env_servers"] = servers
+    return perf
+
+
+def _collect_gpu() -> str:
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return " gpu: " + out.stdout.strip().replace("\n", " ")
+    except Exception:
+        pass
+    return ""
+
+
+def _perf_line(window_start: float, window_steps: int, window_len: int, episode_number: int) -> tuple[float, int]:
+    wall = max(1e-6, time.time() - window_start)
+    line = (
+        f"[perf] episode {episode_number} | last {window_len} eps in {wall:.1f}s "
+        f"({window_len / wall:.2f} eps/s, {window_steps / wall:.1f} steps/s)"
+    )
+    perf = _collect_perf()
+    if perf.get("psutil"):
+        line += f" | python rss={perf['python_rss_mb']}MB cpu={perf['python_cpu_pct']}%"
+        srv = perf.get("env_servers") or []
+        if srv:
+            line += " | servers: " + ", ".join(f"{s['pid']}({s['rss_mb']}MB)" for s in srv)
+    line += _collect_gpu()
+    print(line)
+    return time.time(), 0
+
+
+# ── Parallel training (one worker per env server) ───────────────────────────
+def _port_from_url(server_url: str) -> int:
+    try:
+        return int(server_url.rsplit(":", 1)[1].split("/")[0])
+    except Exception:
+        return 3005
+
+
+def _atomic_save_state_dict(path: str, state_dict: dict) -> None:
+    tmp = path + ".tmp"
+    torch.save(state_dict, tmp)
+    os.replace(tmp, path)
+
+
+def _load_state_dict_any(path: str):
+    checkpoint = torch.load(path, map_location="cpu")
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        return checkpoint["model_state_dict"]
+    return checkpoint
+
+
+def _run_worker_episode(env, policy, opponent_policy, player_id, reset_payload, max_steps):
+    """Run one full episode.
+
+    Returns (obs_list, actions, rewards, steps, winner, agent_hp, opp_hp) for
+    the AGENT's steps only. Log-probs and values are recomputed by the main
+    process under the current policy (async-A2C correction), which also avoids
+    pickling grad-enabled tensors across process boundaries."""
+    obs_list: list = []
+    actions: list = []
+    rewards: list = []
+    try:
+        _, info = env.reset(options=reset_payload)
+    except Exception:
+        return None
+    terminated = False
+    step = 0
+    while not terminated and step < max_steps:
+        step += 1
+        active = str(info.get("activePlayer") or "")
+        if str(active) == str(player_id):
+            actor, collect = policy, True
+        else:
+            actor, collect = opponent_policy, False
+        if not env.available_actions:
+            try:
+                env.refresh()
+            except Exception:
+                break
+            continue
+        obs_vec = torch.tensor(env._get_obs(), dtype=torch.float32)
+        try:
+            action, logp, value = actor.select_action(obs_vec, list(env.available_actions), env.legal_action_mask)
+        except AttributeError:
+            # Legacy policy interface (e.g. RandomActionPolicy): index only.
+            action = actor.choose_action_index(env)
+            logp, value = None, None
+        if action is None:
+            try:
+                env.refresh()
+            except Exception:
+                break
+            continue
+        try:
+            _, reward, terminated, truncated, info = env.step(action)
+        except Exception:
+            break
+        if collect and logp is not None:
+            obs_list.append(obs_vec.numpy().astype(np.float32))
+            actions.append(int(action))
+            rewards.append(float(reward))
+        if truncated:
+            break
+
+    state = env.current_state or {}
+    section = state.get("state") or {}
+    agent_key = "player1" if str(state.get("player1Id")) == str(player_id) else "player2"
+    opp_key = "player2" if agent_key == "player1" else "player1"
+
+    def hp(key: str) -> float:
+        try:
+            return float((section.get(key) or {}).get("base", {}).get("hp", 30.0))
+        except Exception:
+            return 30.0
+
+    agent_hp, opp_hp = hp(agent_key), hp(opp_key)
+    if agent_hp <= 0 and opp_hp > 0:
+        winner = "opponent"
+    elif opp_hp <= 0 and agent_hp > 0:
+        winner = "agent"
+    elif agent_hp <= 0 and opp_hp <= 0:
+        winner = "draw"
+    else:
+        winner = "unresolved"
+    return obs_list, actions, rewards, step, winner, agent_hp, opp_hp
+
+
+def _parallel_worker(
+    worker_id: int,
+    server_url: str,
+    player_id: str,
+    obs_size: int,
+    max_actions: int,
+    log_dir: str,
+    champion_path: str,
+    self_play_probability: float,
+    temperature: float,
+    max_steps: int,
+    decks_file: str,
+    deck_keys: list,
+    fixed_payload: dict,
+    out_queue,
+    stop_event,
+):
+    """Worker process: owns one env server, refreshes policy/champion weights
+    from disk each episode, and pushes trajectories to the main process."""
+    env = SWUEnv(server_url=server_url, player_id=player_id, single_agent_mode=True)
+    policy = TorchPolicy(obs_size=obs_size, max_actions=max_actions, device="cpu", temperature=temperature)
+    champion = TorchPolicy(obs_size=obs_size, max_actions=max_actions, device="cpu")
+    weights_path = os.path.join(log_dir, "policy_worker.pt")
+    last_weights_mtime = 0
+    last_champion_mtime = 0
+
+    while not stop_event.is_set():
+        try:
+            st = os.stat(weights_path)
+            if st.st_mtime_ns != last_weights_mtime:
+                policy.net.load_state_dict(_load_state_dict_any(weights_path))
+                last_weights_mtime = st.st_mtime_ns
+        except FileNotFoundError:
+            pass
+        try:
+            st = os.stat(champion_path)
+            if st.st_mtime_ns != last_champion_mtime:
+                champion.net.load_state_dict(_load_state_dict_any(champion_path))
+                last_champion_mtime = st.st_mtime_ns
+        except FileNotFoundError:
+            pass
+
+        if random.random() < self_play_probability:
+            opponent = _snapshot_policy(policy, "cpu")
+        else:
+            opponent = champion
+
+        if deck_keys:
+            p1_key, p2_key = _sample_episode_decks(deck_keys)
+            payload = _build_reset_payload(p1_key, p2_key, decks_file)[0]
+        else:
+            payload = copy.deepcopy(fixed_payload)
+
+        result = _run_worker_episode(env, policy, opponent, player_id, payload, max_steps)
+        if result and result[0]:
+            out_queue.put(result)
+
+
+def _train_parallel(
+    args,
+    policy,
+    champion_pool,
+    env,
+    logger,
+    board,
+    log_dir,
+    champion_path,
+    deck_keys,
+    fixed_reset_payload,
+    start_episode,
+    verbose,
+):
+    """Async-A2C style: workers roll out episodes on their own env servers;
+    the main process consumes trajectories, updates the policy, and runs the
+    champion-gate tournaments on its own server (args.server_url)."""
+    import multiprocessing as _mp
+
+    base_port = _port_from_url(args.server_url)
+    results: _mp.Queue = _mp.Queue(maxsize=args.num_workers * 8)
+    stop = _mp.Event()
+    workers = []
+    for i in range(args.num_workers):
+        worker = _mp.Process(
+            target=_parallel_worker,
+            args=(
+                i,
+                f"http://localhost:{base_port + 1 + i}",
+                args.player_id,
+                policy.obs_size,
+                policy.max_actions,
+                log_dir,
+                champion_path,
+                args.self_play_probability,
+                args.temperature,
+                args.max_steps,
+                args.decks_file,
+                deck_keys,
+                fixed_reset_payload,
+                results,
+                stop,
+            ),
+            daemon=True,
+        )
+        worker.start()
+        workers.append(worker)
+    if verbose:
+        print(f"[parallel] {args.num_workers} workers started (servers: {base_port + 1}..{base_port + args.num_workers}; "
+              f"tournaments on {base_port})")
+
+    weights_path = os.path.join(log_dir, "policy_worker.pt")
+    _atomic_save_state_dict(weights_path, {key: value.detach().cpu() for key, value in policy.net.state_dict().items()})
+
+    episodes_done = 0
+    total_episodes = args.episodes
+    last_episode_number = 0
+    total_steps = 0
+    batch_logps: list = []
+    batch_returns: list = []
+    batch_values: list = []
+    last_losses = {"policy": 0.0, "value": 0.0, "entropy": 0.0, "total": 0.0}
+    last_tournament = None
+    promotions = 0
+    diagnostics_every = max(10, min(50, args.diagnostics_every))
+    window_returns: list = []
+    window_wins = 0.0
+    window_episodes = 0
+    perf_t0 = time.time()
+    perf_steps = 0
+    perf_episodes = 0
+
+    while episodes_done < total_episodes:
+        try:
+            result = results.get(timeout=1.0)
+        except queue.Empty:
+            continue
+        obs_list, actions, rewards, steps, winner, agent_hp, opp_hp = result
+        episodes_done += 1
+        last_episode_number = start_episode + episodes_done
+        total_steps += steps
+        perf_steps += steps
+        perf_episodes += 1
+        agent_reward = float(sum(rewards))
+
+        if rewards:
+            if winner == "unresolved":
+                rewards[-1] += 0.5 * (agent_hp - opp_hp) / 30.0
+            returns = discounted_returns(rewards, gamma=args.gamma)
+            # Recompute log-probs and values under the CURRENT policy; workers
+            # only ship observations + actions (async-A2C correction).
+            obs_batch = torch.tensor(np.stack(obs_list), dtype=torch.float32)
+            logps, values = policy.evaluate(obs_batch, torch.tensor(actions, dtype=torch.long))
+            batch_logps.extend(list(logps))
+            batch_returns.extend(returns)
+            batch_values.extend(list(values))
+
+        window_returns.append(agent_reward)
+        window_episodes += 1
+        if winner == "agent":
+            window_wins += 1.0
+
+        board.scalar("episode/agent_return", agent_reward, last_episode_number)
+        board.scalar("episode/steps", steps, last_episode_number)
+        board.scalar("episode/win", 1.0 if winner == "agent" else 0.0, last_episode_number)
+        logger.record_episode_summary({
+            "episode": last_episode_number,
+            "winner": winner,
+            "steps": steps,
+            "agent_rewards": agent_reward,
+        })
+
+        # ── A2C update ──
+        if len(batch_logps) > 0 and (episodes_done % args.update_every == 0 or episodes_done >= total_episodes):
+            total_loss, policy_loss, value_loss, entropy = policy.update(
+                batch_logps, batch_returns, batch_values,
+                value_coef=args.value_coef, entropy_coef=args.entropy_coef,
+            )
+            last_losses = {"policy": policy_loss, "value": value_loss, "entropy": entropy, "total": total_loss}
+            n = len(batch_logps)
+            if verbose:
+                print(f"Batch update after episode {last_episode_number} ({n} steps): "
+                      f"total={total_loss:.4f} policy={policy_loss:.4f} value={value_loss:.4f} entropy={entropy:.4f}")
+            for tag, value in (("train/total_loss", total_loss), ("train/policy_loss", policy_loss),
+                               ("train/value_loss", value_loss), ("train/entropy", entropy)):
+                board.scalar(tag, value, last_episode_number)
+            batch_logps, batch_returns, batch_values = [], [], []
+            _atomic_save_state_dict(weights_path, {key: value.detach().cpu() for key, value in policy.net.state_dict().items()})
+            latest_payload = {
+                "model_state_dict": {key: value.detach().cpu() for key, value in policy.net.state_dict().items()},
+                "optimizer_state_dict": policy.optimizer.state_dict(),
+                "episode": last_episode_number,
+                "obs_size": policy.obs_size,
+                "max_actions": policy.max_actions,
+                "checkpoint_source": args.checkpoint,
+            }
+            torch.save(latest_payload, os.path.join(log_dir, "policy_latest.ckpt"))
+
+        # ── Evaluation tournament & champion gate ──
+        if args.tournament_every > 0 and (last_episode_number % args.tournament_every == 0 or episodes_done >= total_episodes):
+            if verbose:
+                print(f"[tournament] starting {args.tournament_games}-game evaluation (candidate vs champion) after episode {last_episode_number}")
+            if deck_keys:
+                make_reset_payload = lambda: _build_reset_payload(*_sample_episode_decks(deck_keys), args.decks_file)[0]
+            else:
+                make_reset_payload = lambda: copy.deepcopy(fixed_reset_payload)
+            last_tournament = run_tournament(
+                env,
+                candidate=policy,
+                champion=champion_pool.champion,
+                reset_payload_factory=make_reset_payload,
+                games=args.tournament_games,
+                max_steps=args.max_steps,
+                stall_polls=args.stall_polls,
+                verbose=verbose,
+            )
+            win_rate = last_tournament["candidate_win_rate"]
+            if verbose:
+                print(f"[tournament] result: candidate {last_tournament['candidate_wins']} wins, "
+                      f"champion {last_tournament['champion_wins']} wins, draws {last_tournament['draws']}, "
+                      f"unresolved {last_tournament['unresolved']} — candidate win rate {win_rate:.1%}")
+            board.scalar("eval/candidate_win_rate", win_rate, last_episode_number)
+            if win_rate > args.promote_win_rate:
+                champion_pool.save_champion(
+                    policy,
+                    episode=last_episode_number,
+                    reason=f"promoted: win rate {win_rate:.1%} > {args.promote_win_rate:.1%}",
+                )
+                promotions += 1
+                if verbose:
+                    print(f"[promotion] candidate replaced the champion at episode {last_episode_number}")
+
+        # ── Diagnostics window ──
+        if episodes_done % diagnostics_every == 0 or episodes_done >= total_episodes:
+            avg_return = sum(window_returns) / max(1, window_episodes)
+            win_rate_pct = 100.0 * window_wins / max(1, window_episodes)
+            champion_wins_display = str(last_tournament["champion_wins"]) if last_tournament is not None else "-"
+            print(f"[Episode {last_episode_number}] Avg Return: {avg_return:+.3f} | Win Rate: {win_rate_pct:.1f}% | "
+                  f"Policy Loss: {last_losses['policy']:.4f} | Value Loss: {last_losses['value']:.4f} | "
+                  f"Champion Wins: {champion_wins_display}")
+            window_returns, window_wins, window_episodes = [], 0.0, 0
+
+        # ── Perf report ──
+        if args.perf_every > 0 and perf_episodes >= args.perf_every:
+            _perf_line(perf_t0, perf_steps, perf_episodes, last_episode_number)
+            perf_t0, perf_steps, perf_episodes = time.time(), 0, 0
+
+    stop.set()
+    for worker in workers:
+        worker.join(timeout=10)
+    for worker in workers:
+        if worker.is_alive():
+            worker.terminate()
+    if verbose:
+        print(f"Training finished (parallel, {args.num_workers} workers, {total_steps} steps). "
+              f"Champion file: {champion_path} (promotions: {promotions})")
+
+
 # ── Main training loop ───────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--server_url", default="http://localhost:3005")
     parser.add_argument("--player_id", default="111")
-    parser.add_argument("--episodes", type=int, default=10)
-    parser.add_argument("--max_steps", type=int, default=1000)
+    parser.add_argument("--episodes", type=int, default=1000)
+    parser.add_argument("--max_steps", type=int, default=500)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--log_dir", default="python_rl/runs/train")
+    parser.add_argument("--log_dir", default="runs/train")
     parser.add_argument("--decks_file", type=str, default="decks.json")
     parser.add_argument("--p1", type=str, help="Deck key for player 1")
     parser.add_argument("--p2", type=str, help="Deck key for player 2")
@@ -540,6 +1083,7 @@ def main():
     # Gated champion pool
     parser.add_argument("--champion_path", type=str, default="", help=f"Champion checkpoint path (default: <log_dir>/{CHAMPION_FILENAME})")
     parser.add_argument("--champion_probability", type=float, default=0.8, help="Fraction of training episodes against the champion (rest: random history checkpoint)")
+    parser.add_argument("--self_play_probability", type=float, default=0.5, help="Fraction of episodes where the opponent is a snapshot of the candidate itself (self-play); keeps games real so win/loss signals actually occur")
     parser.add_argument("--tournament_every", type=int, default=500, help="Run the evaluation tournament every N episodes (also after the final episode)")
     parser.add_argument("--tournament_games", type=int, default=50, help="Games per evaluation tournament (P1/P2 seats alternate evenly)")
     parser.add_argument("--promote_win_rate", type=float, default=0.55, help="Candidate win rate threshold for champion promotion")
@@ -547,12 +1091,24 @@ def main():
     # A2C loss coefficients
     parser.add_argument("--value_coef", type=float, default=0.5, help="c1: critic loss weight")
     parser.add_argument("--entropy_coef", type=float, default=0.01, help="c2: entropy bonus weight")
+    parser.add_argument("--temperature", type=float, default=1.0, help="Sampling softmax temperature (1.0 = unchanged; >1 stops the policy from saturating into a deterministic loop)")
 
     # Diagnostics
     parser.add_argument("--diagnostics_every", type=int, default=20, help="Print the clean summary line every N episodes (clamped to 10-50)")
     parser.add_argument("--no_tensorboard", action="store_true", help="Disable TensorBoard logging even when available")
+    parser.add_argument("--num_workers", type=int, default=1, help="Parallel game workers, each with its own env server on port server_port+1..+N (tournaments use server_port). 1 = serial mode. Start N+1 servers.")
+    parser.add_argument("--perf_every", type=int, default=50, help="Print system perf (eps/s, steps/s, RAM, server processes, GPU) every N episodes (0 = off)")
 
     args = parser.parse_args()
+
+    # The RL env server falls back to EMPTY decks when no cards are supplied,
+    # which leaves the game stuck in the setup resource step forever.
+    if not args.randomize_decks and (not args.p1 or not args.p2):
+        parser.error(
+            "No decks configured: provide both --p1 <deck_key> and --p2 <deck_key>, "
+            "or use --randomize_decks (the RL server's empty-deck default cannot "
+            "complete the setup phase)."
+        )
 
     verbose = not args.quiet
     log_dir = args.log_dir
@@ -566,6 +1122,7 @@ def main():
         max_actions=env.action_space.n,
         lr=args.lr,
         device=args.device,
+        temperature=args.temperature,
     )
 
     champion_pool = ChampionPool(
@@ -575,6 +1132,7 @@ def main():
         max_actions=policy.max_actions,
         device=args.device,
         champion_probability=args.champion_probability,
+        self_play_probability=args.self_play_probability,
         verbose=verbose,
     )
 
@@ -618,6 +1176,28 @@ def main():
     last_losses = {"policy": 0.0, "value": 0.0, "entropy": 0.0, "total": 0.0}
     last_tournament: dict[str, Any] | None = None
     promotions = 0
+    perf_t0 = time.time()
+    perf_steps = 0
+
+    # ── Parallel mode: workers roll out games on their own env servers ──
+    if args.num_workers > 1:
+        _train_parallel(
+            args,
+            policy=policy,
+            champion_pool=champion_pool,
+            env=env,
+            logger=logger,
+            board=board,
+            log_dir=log_dir,
+            champion_path=champion_path,
+            deck_keys=deck_keys,
+            fixed_reset_payload=fixed_reset_payload,
+            start_episode=start_episode,
+            verbose=verbose,
+        )
+        board.close()
+        logger.close()
+        return
 
     for ep in range(args.episodes):
         episode_number = start_episode + ep + 1
@@ -625,25 +1205,20 @@ def main():
         obs, info = env.reset(options=reset_payload)
         if verbose:
             print(f"=== Episode {episode_number}/{start_episode + args.episodes} ===")
-            logger.log(
-                f"[reset] phase={info.get('phase')} activePlayer={info.get('activePlayer')} valid_actions={info.get('num_valid_actions')} prompts={info.get('activePrompts')}",
-                player_id=args.player_id,
-            )
         logger.record_rl_transition({
             "event": "reset",
             "player_id": args.player_id,
             "state": env.current_state,
-            "available_actions": env.available_actions,
-            "info": info,
+            "available_actions": _slim_actions(env.available_actions),
+            "info": _slim_info(info),
             "decks": fixed_deck_meta if not args.randomize_decks else {},
         })
 
-        # ── Gated opponent sampling: 80% champion / 20% history checkpoint ──
-        opponent_policy = champion_pool.sample_opponent()
+        # ── Opponent sampling: self-play snapshot / champion / history ──
+        opponent_policy, opponent_source = champion_pool.sample_opponent(candidate=policy)
         opponent = PolicyOpponent(opponent_policy)
         if verbose:
-            source = "champion" if opponent_policy is champion_pool.champion else ("history" if opponent_policy is not None else "random")
-            print(f"[opponent] episode {episode_number} opponent source: {source}")
+            print(f"[opponent] episode {episode_number} opponent source: {opponent_source}")
 
         logps: list[torch.Tensor] = []
         rewards: list[float] = []
@@ -687,6 +1262,10 @@ def main():
             "winner": None,
             "cards_played": 0,
             "agent_cards_played": 0,
+            "cancel_clicks": 0,
+            "pass_clicks": 0,
+            "done_clicks": 0,
+            "attack_clicks": 0,
         }
 
         no_action_poll_count = 0
@@ -775,8 +1354,8 @@ def main():
                     "player_id": args.player_id,
                     "step_index": step_idx,
                     "state": state_snapshot,
-                    "available_actions": list(env.available_actions),
-                    "info": info,
+                    "available_actions": _slim_actions(env.available_actions),
+                    "info": _slim_info(info),
                     "stall_polls": no_action_poll_count,
                 })
                 episode_metrics["final_phase"] = phase
@@ -815,6 +1394,11 @@ def main():
                     continue
 
                 chosen_action = available_actions[action]
+                _bump_action_metrics(
+                    episode_metrics,
+                    chosen_action,
+                    (prompt_snapshot.get(agent_key) or {}).get("menuTitle", "") if agent_key else "",
+                )
                 if args.debug_steps:
                     logger.log(f"[agent] p1 chose [{action}] {_describe_action(chosen_action, action)}", player_id=args.player_id)
 
@@ -827,14 +1411,14 @@ def main():
                         "player_id": args.player_id,
                         "step_index": step_idx,
                         "state": state_snapshot,
-                        "available_actions": available_actions,
+                        "available_actions": _slim_actions(available_actions),
                         "action_index": action,
                         "action": chosen_action,
                         "reward": -10.0,
                         "terminated": True,
                         "truncated": False,
                         "next_state": copy.deepcopy(env.current_state),
-                        "info": info,
+                        "info": _slim_info(info),
                         "error": str(exc),
                     })
                     episode_metrics["final_phase"] = phase
@@ -858,17 +1442,19 @@ def main():
                         episode_metrics["agent_cards_played"] += 1
 
                 state_section = (step_info or {}).get("state_dict") or env.current_state or {}
+                if (step_info or {}).get("no_progress"):
+                    _log_no_progress(logger, args.player_id, step_idx, chosen_action, env)
                 logger.record_rl_transition({
                     "event": "step",
                     "player_id": args.player_id,
                     "step_index": step_idx,
                     "state": state_snapshot,
-                    "available_actions": available_actions,
+                    "available_actions": _slim_actions(available_actions),
                     "action_index": action,
                     "action": chosen_action,
                     "reward": reward,
                     "terminated": terminated,
-                    "info": step_info,
+                    "info": _slim_info(step_info),
                 })
                 logger.record_step_analysis_data({
                     "episode": episode_number,
@@ -919,6 +1505,11 @@ def main():
                     continue
 
                 opponent_action = list(env.available_actions)[action] if 0 <= action < len(env.available_actions) else None
+                _bump_action_metrics(
+                    episode_metrics,
+                    opponent_action,
+                    (prompt_snapshot.get(opp_key) or {}).get("menuTitle", "") if opp_key else "",
+                )
                 if args.debug_steps and opponent_action is not None:
                     logger.log(f"[opponent] p2 chose [{action}] {_describe_action(opponent_action, action)}", player_id=args.player_id)
 
@@ -931,18 +1522,18 @@ def main():
                         "player_id": "opponent",
                         "step_index": step_idx,
                         "state": state_snapshot,
-                        "available_actions": list(env.available_actions),
+                        "available_actions": _slim_actions(env.available_actions),
                         "action_index": action,
                         "action": opponent_action,
                         "reward": -10.0,
                         "terminated": True,
                         "truncated": False,
                         "next_state": copy.deepcopy(env.current_state),
-                        "info": info,
+                        "info": _slim_info(info),
                         "error": str(exc),
                     })
                     episode_metrics["final_phase"] = phase
-                    episode_metrics["opponent_rewards"] += -10.0
+                    episode_metrics["opponent_rewards"] += 10.0
                     episode_metrics["total_rewards"] += -10.0
                     terminated = True
                     step_info = info
@@ -950,7 +1541,9 @@ def main():
 
                 episode_metrics["total_rewards"] += float(reward)
                 episode_metrics["total_reward_steps"] += 1
-                episode_metrics["opponent_rewards"] += float(reward)
+                # `reward` is shaped from the agent's perspective; negate it for
+                # the opponent-perspective bookkeeping column.
+                episode_metrics["opponent_rewards"] += -float(reward)
 
                 if opponent_action and str(opponent_action.get("actionType") or "") == "clickCard":
                     card_uuid = opponent_action.get("uuid", "")
@@ -959,17 +1552,20 @@ def main():
                     if in_hand:
                         episode_metrics["cards_played"] += 1
 
+                if (step_info or {}).get("no_progress"):
+                    _log_no_progress(logger, "opponent", step_idx, opponent_action or {}, env)
+
                 logger.record_rl_transition({
                     "event": "step",
                     "player_id": "opponent",
                     "step_index": step_idx,
                     "state": state_snapshot,
-                    "available_actions": list(env.available_actions),
+                    "available_actions": _slim_actions(env.available_actions),
                     "action_index": action,
                     "action": opponent_action,
                     "reward": reward,
                     "terminated": terminated,
-                    "info": step_info,
+                    "info": _slim_info(step_info),
                 })
                 logger.record_step_analysis_data({
                     "episode": episode_number,
@@ -1020,6 +1616,13 @@ def main():
 
         # Accumulate the episode into the A2C batch.
         if len(rewards) > 0:
+            if episode_metrics["winner"] == "unresolved":
+                # The episode was truncated at max_steps, so the env never
+                # produced its ±10 win/loss signal. Score the final board so the
+                # policy still learns that damaging the enemy base is good:
+                # leading on base HP → positive, trailing → negative.
+                bonus = 0.5 * (final_agent["base_hp"] - final_opp["base_hp"]) / 30.0
+                rewards[-1] += bonus
             returns = discounted_returns(rewards, gamma=args.gamma)
             batch_logps.extend(logps)
             batch_returns.extend(returns)
@@ -1121,6 +1724,19 @@ def main():
         }
         logger.record_episode_summary(summary)
 
+        if verbose:
+            maxed = step_idx >= args.max_steps
+            print(
+                f"[episode {episode_number}] steps={step_idx}{' (max_steps)' if maxed else ''} "
+                f"winner={episode_metrics['winner']} "
+                f"| bases: agent {final_agent['base_hp']:.0f} HP ({final_agent['board_damage']:.0f} dmg dealt), "
+                f"opp {final_opp['base_hp']:.0f} HP ({final_opp['board_damage']:.0f} dmg dealt) "
+                f"| agent rew {episode_metrics['agent_rewards']:+.2f} ({episode_metrics['agent_turns']} turns), "
+                f"opp rew {episode_metrics['opponent_rewards']:+.2f} ({episode_metrics['opponent_turns']} turns) "
+                f"| cancel={episode_metrics['cancel_clicks']} pass={episode_metrics['pass_clicks']} "
+                f"done={episode_metrics['done_clicks']} attack={episode_metrics['attack_clicks']}"
+            )
+
         if episode_number % diagnostics_every == 0 or ep == args.episodes - 1:
             avg_return = sum(window_returns) / max(1, window_episodes)
             win_rate_pct = 100.0 * window_wins / max(1, window_episodes)
@@ -1133,6 +1749,11 @@ def main():
             window_returns = []
             window_wins = 0.0
             window_episodes = 0
+
+        # ── Perf report (serial mode) ──
+        perf_steps += step_idx
+        if args.perf_every > 0 and episode_number % args.perf_every == 0:
+            perf_t0, perf_steps = _perf_line(perf_t0, perf_steps, args.perf_every, episode_number)
 
         # ── Persist candidate checkpoints ──
         latest_payload = {

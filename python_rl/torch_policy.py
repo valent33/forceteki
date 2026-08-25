@@ -92,6 +92,7 @@ class TorchPolicy:
         dropout: float = 0.1,
         lr: float = 1e-3,
         device: str = "cpu",
+        temperature: float = 1.0,
         # Backward-compatible no-ops from the old candidate-scoring policy:
         action_feature_size: int = 40,
         action_size: int | None = None,
@@ -101,6 +102,7 @@ class TorchPolicy:
             max_actions = int(action_size)  # older trainer code passed a fixed action size
         self.obs_size = int(obs_size)
         self.max_actions = int(max_actions)
+        self.temperature = max(float(temperature), 1e-3)
         # Kept for legacy attribute access (e.g. SnapshotOpponent).
         self.action_feature_size = int(action_feature_size)
         self.net = DualHeadNetwork(
@@ -127,6 +129,7 @@ class TorchPolicy:
         """
         logits, value = self._compute_logits(obs_tensor)
         n = len(available_actions) if available_actions is not None else self.max_actions
+        n = max(0, min(int(n), self.max_actions))  # never exceed the π-head slots
         mask_t = self._build_mask_tensor(n, legal_mask)
         logits = torch.where(mask_t > 0.0, logits, torch.full_like(logits, ILLEGAL_LOGIT))
         return logits, value
@@ -144,7 +147,8 @@ class TorchPolicy:
             return None, None, None
 
         logits, value = self.masked_logits(obs_tensor, available_actions, legal_mask)
-        dist = torch.distributions.Categorical(logits=logits)
+        # Sampling temperature: >1 keeps exploration alive when logits saturate.
+        dist = torch.distributions.Categorical(logits=logits / self.temperature)
         action_tensor = dist.sample()
         return int(action_tensor.item()), dist.log_prob(action_tensor), value.detach()
 
@@ -207,6 +211,7 @@ class TorchPolicy:
         return logits.squeeze(0), value.squeeze(-1).squeeze(0)
 
     def _build_mask_tensor(self, n: int, legal_mask) -> torch.Tensor:
+        n = max(0, min(int(n), self.max_actions))  # guard: indices must fit the mask
         mask = torch.zeros(self.max_actions, dtype=torch.float32, device=self.device)
         if legal_mask is not None and len(legal_mask) >= n:
             for i in range(n):

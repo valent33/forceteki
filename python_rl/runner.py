@@ -13,6 +13,24 @@ from policy import RandomActionPolicy
 from swu_env import SWUEnv
 
 
+def _slim_actions(actions, cap: int = 24) -> dict:
+    """Compact serialisation of an action list for transitions.jsonl.
+
+    Giant prompts (e.g. "Choose an option from the list" listing every card
+    title) used to dump 1700+ full action dicts per transition. Log a count
+    plus the first `cap` slimmed actions — enough to debug, small enough to
+    keep the log usable."""
+    actions = list(actions or [])
+    shown = []
+    for action in actions[:cap]:
+        shown.append({
+            key: action.get(key)
+            for key in ("actionType", "arg", "uuid", "method", "internalName", "promptText", "cardUuid", "uuids")
+            if action.get(key) is not None
+        })
+    return {"count": len(actions), "shown": shown}
+
+
 @dataclass(frozen=True)
 class PlayerSpec:
     player_id: str
@@ -202,7 +220,7 @@ class SingleAgentEpisodeRunner:
                 "player_id": self.player_id,
                 "step_index": self.steps,
                 "state": copy.deepcopy(self.env.current_state),
-                "available_actions": copy.deepcopy(self.env.available_actions),
+                "available_actions": _slim_actions(self.env.available_actions),
                 "reset_options": copy.deepcopy(reset_options),
             }
         )
@@ -269,7 +287,7 @@ class SingleAgentEpisodeRunner:
                             "player_id": self.player_id,
                             "step_index": self.steps,
                             "state": state_before,
-                            "available_actions": actions_before,
+                            "available_actions": _slim_actions(actions_before),
                             "info": info_before,
                             "reason": "stalled_no_action",
                             "stall_polls": no_action_polls,
@@ -317,7 +335,7 @@ class SingleAgentEpisodeRunner:
                         "player_id": self.player_id,
                         "step_index": self.steps,
                         "state": state_before,
-                        "available_actions": actions_before,
+                        "available_actions": _slim_actions(actions_before),
                         "action_index": action_index,
                         "action": copy.deepcopy(actions_before[action_index]) if 0 <= action_index < len(actions_before) else None,
                         "reward": reward,
@@ -345,7 +363,7 @@ class SingleAgentEpisodeRunner:
                     "player_id": self.player_id,
                     "step_index": self.steps,
                     "state": state_before,
-                    "available_actions": actions_before,
+                    "available_actions": _slim_actions(actions_before),
                     "action_index": action_index,
                     "action": copy.deepcopy(actions_before[action_index]) if 0 <= action_index < len(actions_before) else None,
                     "reward": reward,
@@ -404,10 +422,7 @@ class TwoAgentEpisodeRunner:
                 "player_id": None,
                 "step_index": self.steps,
                 "state": copy.deepcopy(self.shared_state),
-                "available_actions": {
-                    pid: copy.deepcopy(self.envs[pid].available_actions)
-                    for pid in self.envs
-                },
+                "available_actions": {pid: _slim_actions(self.envs[pid].available_actions) for pid in self.envs},
                 "reset_options": copy.deepcopy(reset_options),
             }
         )
@@ -450,7 +465,7 @@ class TwoAgentEpisodeRunner:
                             "player_id": player_id,
                             "step_index": self.steps,
                             "state": state_before,
-                            "available_actions": actions_before,
+                            "available_actions": _slim_actions(actions_before),
                             "action_index": action_index,
                             "action": copy.deepcopy(actions_before[action_index]) if 0 <= action_index < len(actions_before) else None,
                             "reward": -10.0,
@@ -472,7 +487,7 @@ class TwoAgentEpisodeRunner:
                         "player_id": player_id,
                         "step_index": self.steps,
                         "state": state_before,
-                        "available_actions": actions_before,
+                        "available_actions": _slim_actions(actions_before),
                         "action_index": action_index,
                         "action": copy.deepcopy(actions_before[action_index]) if 0 <= action_index < len(actions_before) else None,
                         "reward": reward,

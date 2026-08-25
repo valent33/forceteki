@@ -768,7 +768,7 @@ class QueueBotClient:
         prompt_uuid = prompt_state.get("promptUuid")
         candidates: list[dict[str, Any]] = []
 
-        display_cards = [card for card in (prompt_state.get("displayCards") or []) if card.get("selectionState") != "invalid"]
+        display_cards = [card for card in (prompt_state.get("displayCards") or []) if str(card.get("selectionState", "")).lower() not in {"invalid", "unselectable", "viewonly"}]
         per_card_buttons = [button for button in (prompt_state.get("perCardButtons") or []) if not button.get("disabled", False)]
         buttons = [button for button in (prompt_state.get("buttons") or []) if not button.get("disabled", False)]
         dropdown_options = prompt_state.get("dropdownListOptions") or []
@@ -853,6 +853,12 @@ class QueueBotClient:
 
         for button in buttons:
             command = button.get("command") or "menuButton"
+            button_text = str(button.get("text", "")).strip().lower()
+            button_arg = str(button.get("arg", "")).strip().lower()
+            # Cancel is a zero-progress no-op: never offer it (same rule as the
+            # training env) — the agent must commit to the action it picked.
+            if "cancel" in button_text or "cancel" in button_arg:
+                continue
             candidates.append({
                 "kind": command,
                 "actionType": "clickPrompt",
