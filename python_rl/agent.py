@@ -40,6 +40,21 @@ def _bucketed_hash_features(text: str, size: int) -> list[float]:
     return buckets
 
 
+_CARD_BY_ID: dict[str, dict[str, Any]] | None = None
+
+
+def _card_db_by_id() -> dict[str, dict[str, Any]]:
+    """Card database keyed by the numeric `id` field the GUI client sends."""
+    global _CARD_BY_ID
+    if _CARD_BY_ID is None:
+        _CARD_BY_ID = {}
+        for entry in load_card_database().values():
+            cid = entry.get("id")
+            if cid is not None:
+                _CARD_BY_ID[str(cid)] = entry
+    return _CARD_BY_ID
+
+
 def _load_policy_checkpoint(torch_module: Any, policy: Any, checkpoint_path: str, device: str) -> dict[str, Any]:
     checkpoint = torch_module.load(checkpoint_path, map_location=device)
 
@@ -489,6 +504,11 @@ class QueueBotClient:
         self.steps_taken = 0
         self.action_lock = threading.Lock()
         self.policy: Any = None
+        # Detached env instance used ONLY for its observation encoder: the GUI
+        # socket state is converted to the env state shape in
+        # `_gui_state_to_env_state`, then `_get_obs()` produces the same 2386-
+        # dim tensor the policy was trained on.
+        self.obs_env = SWUEnv(server_url="http://localhost:9", player_id=player_id, single_agent_mode=True)
         if self.policy_checkpoint:
             if not os.path.exists(self.policy_checkpoint):
                 raise FileNotFoundError(f"Policy checkpoint not found: {self.policy_checkpoint}")
@@ -805,52 +825,9 @@ class QueueBotClient:
                 })
             return self._annotate_candidates(state, prompt_state, candidates)
 
-        if display_cards:
-            if per_card_buttons:
-                for card in display_cards:
-                    for button in per_card_buttons:
-                        candidates.append({
-                            "kind": "perCardMenuButton",
-                            "actionType": "clickPrompt",
-                            "arg": button.get("arg", ""),
-                            "cardUuid": card.get("cardUuid"),
-                            "uuid": prompt_uuid,
-                            "method": button.get("command") or "perCardMenuButton",
-                            "description": f"{button.get('text', 'button')} on {card.get('internalName', card.get('cardUuid'))}",
-                        })
-            else:
-                for card in display_cards:
-                    candidates.append({
-                        "kind": "menuButton",
-                        "actionType": "clickPrompt",
-                        "arg": card.get("cardUuid"),
-                        "uuid": prompt_uuid,
-                        "method": "menuButton",
-                        "description": f"select card {card.get('cardUuid')}",
-                    })
-
-        if prompt_state.get("promptType") == "resource" and selected_cards:
-            selected_uuids = {card.get("uuid") for card in selected_cards if isinstance(card, dict)}
-            selectable_cards = [card for card in selectable_cards if card.get("uuid") not in selected_uuids]
-
-        for card in selectable_cards:
-            candidates.append({
-                "kind": "cardClicked",
-                "actionType": "clickCard",
-                "cardUuid": card.get("uuid"),
-                "description": card.get("internalName", card.get("uuid", "card")),
-            })
-
-        for option in dropdown_options:
-            candidates.append({
-                "kind": "menuButton",
-                "actionType": "clickPrompt",
-                "arg": option,
-                "uuid": prompt_uuid,
-                "method": "menuButton",
-                "description": f"dropdown {option}",
-            })
-
+        # Buttons first — the RL env action builder appends buttons before
+        # card clicks, and the policy head's 100 slots are positional, so the
+        # GUI candidate order must match training order.
         for button in buttons:
             command = button.get("command") or "menuButton"
             button_text = str(button.get("text", "")).strip().lower()
@@ -868,6 +845,52 @@ class QueueBotClient:
                 "description": button.get("text", "button"),
             })
 
+        if display_cards:
+            if per_card_buttons:
+                for card in display_cards:
+                    for button in per_card_buttons:
+                        candidates.append({
+                            "kind": "perCardMenuButton",
+                            "actionType": "clickPrompt",
+                            "arg": button.get("arg", ""),
+                            "cardUuid": card.get("cardUuid"),
+                            "uuid": prompt_uuid,
+                            "method": button.get("command") or "perCardMenuButton",
+                            "description": f"{button.get('text', 'button')} on {card.get('name') or card.get('internalName') or card.get('cardUuid')}",
+                        })
+            else:
+                for card in display_cards:
+                    candidates.append({
+                        "kind": "menuButton",
+                        "actionType": "clickPrompt",
+                        "arg": card.get("cardUuid"),
+                        "uuid": prompt_uuid,
+                        "method": "menuButton",
+                        "description": f"select card {card.get('name') or card.get('internalName') or card.get('cardUuid')}",
+                    })
+
+        if prompt_state.get("promptType") == "resource" and selected_cards:
+            selected_uuids = {card.get("uuid") for card in selected_cards if isinstance(card, dict)}
+            selectable_cards = [card for card in selectable_cards if card.get("uuid") not in selected_uuids]
+
+        for card in selectable_cards:
+            candidates.append({
+                "kind": "cardClicked",
+                "actionType": "clickCard",
+                "cardUuid": card.get("uuid"),
+                "description": card.get("name") or card.get("internalName") or card.get("uuid", "card"),
+            })
+
+        for option in dropdown_options:
+            candidates.append({
+                "kind": "menuButton",
+                "actionType": "clickPrompt",
+                "arg": option,
+                "uuid": prompt_uuid,
+                "method": "menuButton",
+                "description": f"dropdown {option}",
+            })
+
         return self._annotate_candidates(state, prompt_state, candidates)
 
     def _build_resource_candidates(self, prompt_state: dict[str, Any], selectable_cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -882,7 +905,7 @@ class QueueBotClient:
         candidates: list[dict[str, Any]] = []
         for card_group in itertools.combinations(resource_cards, resource_count):
             uuids = [str(card.get("uuid")) for card in card_group]
-            names = [str(card.get("internalName", card.get("uuid", "card"))) for card in card_group]
+            names = [str(card.get("name") or card.get("internalName") or card.get("uuid", "card")) for card in card_group]
             candidates.append({
                 "kind": "macro_resource_cards",
                 "actionType": "macro_resource_cards",
@@ -975,9 +998,8 @@ class QueueBotClient:
         return features
 
     def _build_policy_observation(self, state: dict[str, Any], prompt_state: dict[str, Any]) -> list[float]:
-        # Zero-pad the queue-mode feature vector to the policy's obs size (legacy
-        # queue features occupy the first 30 slots; SWUEnv-trained checkpoints
-        # expect the full 2386-dim tensor and act approximately randomly here).
+        # Legacy queue-mode fallback: hash-based features in the first 30 slots,
+        # used only for old-format checkpoints (not the 2386-dim trained ones).
         obs = [0.0] * int(getattr(self.policy, "obs_size", 64) or 64)
         phase = str(state.get("phase") or "unknown")
         prompt_type = str(prompt_state.get("promptType") or "unknown")
@@ -1006,6 +1028,132 @@ class QueueBotClient:
 
         return obs
 
+    def _gui_state_to_env_state(self, state: dict[str, Any]) -> dict[str, Any]:
+        """Convert the GUI socket game state into the SWUEnv `current_state`
+        shape so the trained observation encoder can read it."""
+        players = state.get("players") or {}
+        my_id = str(self.player_id)
+        opp_id = next((str(pid) for pid in players if str(pid) != my_id), None)
+        db_by_id = _card_db_by_id()
+
+        def convert_card(card: Any) -> dict[str, Any]:
+            if not isinstance(card, dict):
+                return {}
+            db = db_by_id.get(str(card.get("id")))
+            return {
+                "uuid": card.get("uuid"),
+                "internalName": (db or {}).get("internalName", ""),
+                "name": card.get("name"),
+                "power": card.get("power"),
+                "hp": card.get("hp"),
+                "damage": card.get("damage"),
+                "exhausted": bool(card.get("exhausted")),
+                "sentinel": bool(card.get("sentinel")),
+                "zone": card.get("zone"),
+            }
+
+        def convert_player(pid: str | None) -> dict[str, Any]:
+            if pid is None:
+                return {}
+            ps = players.get(pid) or {}
+            piles = ps.get("cardPiles") or {}
+            credits = ps.get("credits") or piles.get("credits") or []
+            resources = piles.get("resources") or []
+            return {
+                "id": pid,
+                "base": convert_card(ps.get("base")) or {"hp": 30},
+                "leader": convert_card(ps.get("leader")),
+                "hand": [convert_card(c) for c in (piles.get("hand") or []) if isinstance(c, dict)],
+                "spaceArena": [convert_card(c) for c in (piles.get("spaceArena") or []) if isinstance(c, dict)],
+                "groundArena": [convert_card(c) for c in (piles.get("groundArena") or []) if isinstance(c, dict)],
+                "discard": [convert_card(c) for c in (piles.get("discard") or []) if isinstance(c, dict)],
+                "resources": resources,
+                "deck": [{}] * max(0, int(ps.get("numCardsInDeck") or 0)),
+                "readyResourceCount": float(ps.get("availableResources") or 0),
+                "exhaustedResourceCount": max(0.0, float(len(resources)) - float(ps.get("availableResources") or 0)),
+                "credits": float(len(credits)),
+                "hasForceToken": bool((ps.get("forceToken") or {}).get("active")),
+            }
+
+        def convert_prompt(pid: str | None) -> dict[str, Any]:
+            if pid is None:
+                return {}
+            ps = players.get(pid) or {}
+            pstate = ps.get("promptState") or {}
+            # The GUI does not serialize selectableCards/selectedCards lists;
+            # collect them from the per-card flags instead.
+            selectable: list[str] = []
+            selected: list[str] = []
+            for zone_cards in (ps.get("cardPiles") or {}).values():
+                if not isinstance(zone_cards, list):
+                    continue
+                for card in zone_cards:
+                    if not isinstance(card, dict) or not card.get("uuid"):
+                        continue
+                    if card.get("selectable"):
+                        selectable.append(str(card["uuid"]))
+                    if card.get("selected"):
+                        selected.append(str(card["uuid"]))
+            for key in ("leader", "base"):
+                card = ps.get(key)
+                if isinstance(card, dict) and card.get("uuid"):
+                    if card.get("selectable"):
+                        selectable.append(str(card["uuid"]))
+                    if card.get("selected"):
+                        selected.append(str(card["uuid"]))
+            return {
+                "menuTitle": pstate.get("menuTitle"),
+                "promptUuid": pstate.get("promptUuid"),
+                "promptType": pstate.get("promptType"),
+                "buttons": [
+                    {"text": b.get("text"), "arg": b.get("arg"), "disabled": b.get("disabled"), "command": b.get("command")}
+                    for b in (pstate.get("buttons") or []) if isinstance(b, dict)
+                ],
+                "dropdownListOptions": pstate.get("dropdownListOptions") or [],
+                "selectableCards": selectable,
+                "selectedCards": selected,
+                "displayCards": pstate.get("displayCards") or [],
+                "perCardButtons": pstate.get("perCardButtons") or [],
+                "selectNumber": pstate.get("selectNumber"),
+                "distributeAmongTargets": pstate.get("distributeAmongTargets"),
+                "debug_legalActions": [],
+            }
+
+        active_id: str | None = None
+        # In the RL env server, `activePlayer` serializes the INITIATIVE holder
+        # (see envServer.ts: `initiativePlayer?.id`), and that is what the obs
+        # encoder's first two features read. Match it here.
+        for pid, ps in players.items():
+            if isinstance(ps, dict) and ps.get("hasInitiative"):
+                active_id = str(pid)
+                break
+        if active_id is None:
+            for pid, ps in players.items():
+                if isinstance(ps, dict) and ps.get("isActionPhaseActivePlayer"):
+                    active_id = str(pid)
+                    break
+        if active_id is None:
+            for pid, ps in players.items():
+                title = str((((ps or {}).get("promptState") or {}).get("menuTitle") or ""))
+                if title and "waiting" not in title.lower():
+                    active_id = str(pid)
+                    break
+
+        return {
+            "phase": state.get("phase"),
+            "activePlayer": active_id or my_id,
+            "player1Id": my_id,
+            "player2Id": opp_id,
+            "prompts": {
+                "player1": convert_prompt(my_id),
+                "player2": convert_prompt(opp_id),
+            },
+            "state": {
+                "player1": convert_player(my_id),
+                "player2": convert_player(opp_id),
+            },
+        }
+
     def _choose_policy_candidate(self, state: dict[str, Any], prompt_state: dict[str, Any], candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
         if not candidates:
             return None
@@ -1016,11 +1164,32 @@ class QueueBotClient:
         if len(candidates) > int(getattr(self.policy, "max_actions", 0)):
             return random.choice(candidates)
 
-        obs_tensor = torch.tensor(self._build_policy_observation(state, prompt_state), dtype=torch.float32, device=self.policy.device)
+        # Feed the REAL 2386-dim observation when the checkpoint is the
+        # DualHeadNetwork trained by swu_env; fall back to the legacy hash
+        # features only for old-format checkpoints.
+        obs_dim = int(self.obs_env.observation_space.shape[0])
+        if int(getattr(self.policy, "obs_size", 0)) == obs_dim:
+            self.obs_env.current_state = self._gui_state_to_env_state(state)
+            obs_tensor = torch.tensor(self.obs_env._get_obs(), dtype=torch.float32, device=self.policy.device)
+        else:
+            obs_tensor = torch.tensor(self._build_policy_observation(state, prompt_state), dtype=torch.float32, device=self.policy.device)
 
         with torch.no_grad():
-            logits, _state_value = self.policy.masked_logits(obs_tensor, candidates)
-            action_index = int(torch.argmax(logits).item())
+            logits, state_value = self.policy.masked_logits(obs_tensor, candidates)
+            n = len(candidates)
+            probs = torch.softmax(logits[:n], dim=-1)
+            ranked = sorted(range(n), key=lambda index: float(probs[index]), reverse=True)
+            action_index = ranked[0]
+
+        if self.console_logging:
+            self._log(f"[{self.player_id}] V(s) = {float(state_value):+.3f} | action probabilities:")
+            for rank, index in enumerate(ranked[:12]):
+                candidate = candidates[index]
+                marker = "*" if rank == 0 else " "
+                self._log(
+                    f"[{self.player_id}]   {marker}{float(probs[index]):6.1%} "
+                    f"[{index}] {candidate.get('kind')} '{candidate.get('description', 'unknown')}'"
+                )
 
         if 0 <= action_index < len(candidates):
             return candidates[action_index]

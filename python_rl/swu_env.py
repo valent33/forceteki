@@ -173,13 +173,11 @@ class SWUEnv(gym.Env):
         # prompt changes, so a saturated policy can't spin in play→Cancel cycles.
         self._loop_blocks: dict[str, tuple[str, str]] = {}
         self._step_history: deque[tuple] = deque(maxlen=8)
-        self._loop_block_print_budget = 3
+        self._loop_block_print_budget = 1
         # True when the most recent env.step() left the game state unchanged
         # (server did not accept the action) — consumed by the trainer to log
         # illegal actions with the server payload.
         self._last_step_no_progress = False
-        # Gates the one-time [ENV] number-prompt debug dump per prompt instance.
-        self._last_number_dump_sig: tuple | None = None
         # Deck definitions (internal names) captured from the /reset payload —
         # used to build the opponent info-set densities in Block 4.
         self._deck_definitions: dict[str, Counter] = {"player1": Counter(), "player2": Counter()}
@@ -214,7 +212,7 @@ class SWUEnv(gym.Env):
         # Fresh game → fresh loop-detection history.
         self._loop_blocks.clear()
         self._step_history.clear()
-        self._loop_block_print_budget = 3
+        self._loop_block_print_budget = 1
         self._update_available_actions()
         return self._get_obs(), self._get_info()
 
@@ -587,16 +585,8 @@ class SWUEnv(gym.Env):
         if not player_prompt or "Waiting for opponent" in menu_title:
             return self.legal_action_mask
 
-        # ── DEBUG: log when we enter action building with a number prompt ──
-        menu_lower = menu_title.lower()
-        if "choose a number" in menu_lower or "choose number" in menu_lower:
-            dump_sig = (p_key, str(player_prompt.get("promptUuid", "")))
-            if dump_sig != getattr(self, "_last_number_dump_sig", None):
-                self._last_number_dump_sig = dump_sig
-                _sys.stderr.write(f"[ENV] number-prompt p_key={p_key} p_id={p_id} "
-                                  f"menu={menu_title!r} buttons={len(player_prompt.get('buttons',[]))} "
-                                  f"keys={sorted(player_prompt.keys())!r}\n")
-                _sys.stderr.flush()
+        # ── Number prompts are answered from the selectNumber data in the
+        # last-resort fallback below (no debug print needed). ──
 
         has_buttons = "buttons" in player_prompt and len(player_prompt["buttons"]) > 0
         has_dropdowns = "dropdownListOptions" in player_prompt and len(player_prompt["dropdownListOptions"]) > 0
@@ -1403,8 +1393,12 @@ class SWUEnv(gym.Env):
             return mask
 
         # Actions blocked by no-progress loop detection while this exact prompt
-        # is open (see `_track_loop_repeat`).
-        current_prompt_sig = (p_key, str((player_prompt or {}).get("menuTitle", "")))
+        # instance is open (see `_track_loop_repeat`).
+        current_prompt_sig = (
+            p_key,
+            str((player_prompt or {}).get("menuTitle", "")),
+            str((player_prompt or {}).get("promptUuid", "")),
+        )
         blocked_keys = {key for key, sig in self._loop_blocks.items() if sig == current_prompt_sig}
 
         for index, action in enumerate(actions):
@@ -1522,15 +1516,19 @@ class SWUEnv(gym.Env):
         menu_title = str(prompt.get("menuTitle", ""))
         if not menu_title or "waiting for opponent" in menu_title.lower():
             return
+        # Include the prompt uuid so repeated prompts of the same title — e.g.
+        # several queued optional triggers each asking "... or pass" — are NOT
+        # mistaken for a no-progress loop. Same-instance retries still block.
+        prompt_uuid = str(prompt.get("promptUuid", ""))
         selected = tuple(sorted(str(u) for u in prompt.get("selectedCards", [])))
-        prompt_sig = (p_key, menu_title, selected)
+        prompt_sig = (p_key, menu_title, selected, prompt_uuid)
         player_sig = self._player_state_sig(state, p_id)
         triple = (prompt_sig, player_sig, self._action_key(action))
 
         if triple in self._step_history:
             key = triple[2]
-            if self._loop_blocks.get(key) != prompt_sig[:2]:
-                self._loop_blocks[key] = prompt_sig[:2]
+            if self._loop_blocks.get(key) != prompt_sig:
+                self._loop_blocks[key] = prompt_sig
                 if self._loop_block_print_budget > 0:
                     self._loop_block_print_budget -= 1
                     _sys.stderr.write(
