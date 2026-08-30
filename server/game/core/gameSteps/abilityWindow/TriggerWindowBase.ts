@@ -156,6 +156,14 @@ export abstract class TriggerWindowBase extends BaseStep {
     }
 
     protected promptUnresolvedAbilities() {
+        if (!this.currentlyResolvingPlayer) {
+            // All abilities were removed from the window after the player
+            // resolution order was chosen (e.g. their sources left play
+            // mid-attack) — there is nothing left to prompt, so the window
+            // is done instead of failing the not-null contract.
+            return true;
+        }
+
         Contract.assertNotNullLike(this.currentlyResolvingPlayer);
 
         this.choosePlayerResolutionOrderComplete = true;

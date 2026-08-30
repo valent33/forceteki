@@ -21,19 +21,25 @@ export default class LattsRazziDeadlyWhipmaster extends NonLeaderUnitCard {
                     ['Give an Experience token to this unit']: AbilityHelper.immediateEffects.giveExperience(),
                 }
             },
-            then: (thenContext) => ({
-                title: 'Deal damage equal to her power to an enemy ground unit',
-                targetResolver: {
-                    activePromptTitle: `Deal ${thenContext.source.getPower()} damage to an enemy ground unit`,
-                    controller: RelativePlayer.Opponent,
-                    cardTypeFilter: WildcardCardType.Unit,
-                    zoneFilter: ZoneName.GroundArena,
-                    immediateEffect: AbilityHelper.immediateEffects.damage({
-                        amount: thenContext.source.getPower(),
-                        source: thenContext.source,
-                    })
-                }
-            })
+            then: (thenContext) => {
+                // The unit may have left play while the shield/experience
+                // choice resolved — getPower() contract-asserts on a card in
+                // discard (via its `upgrades` zone check), so guard it.
+                const power = thenContext.source.isInPlay() ? thenContext.source.getPower() : 0;
+                return {
+                    title: 'Deal damage equal to her power to an enemy ground unit',
+                    targetResolver: {
+                        activePromptTitle: `Deal ${power} damage to an enemy ground unit`,
+                        controller: RelativePlayer.Opponent,
+                        cardTypeFilter: WildcardCardType.Unit,
+                        zoneFilter: ZoneName.GroundArena,
+                        immediateEffect: AbilityHelper.immediateEffects.damage({
+                            amount: power,
+                            source: thenContext.source,
+                        })
+                    }
+                };
+            }
         });
     }
 }

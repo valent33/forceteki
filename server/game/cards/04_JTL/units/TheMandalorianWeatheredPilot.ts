@@ -34,7 +34,10 @@ export default class TheMandalorianWeatheredPilot extends NonLeaderUnitCard {
                 mode: TargetMode.Single,
                 controller: RelativePlayer.Opponent,
                 cardTypeFilter: WildcardCardType.Unit,
-                cardCondition: (card, context) => card.zoneName === context.source.parentCard.zoneName,
+                // Guard with isInPlay(): when the pilot left play mid-window the
+                // `parentCard` getter contract-asserts on the null-like value.
+                cardCondition: (card, context) => context.source.isInPlay()
+                    && card.zoneName === context.source.parentCard.zoneName,
                 immediateEffect: AbilityHelper.immediateEffects.exhaust()
             }
         });
