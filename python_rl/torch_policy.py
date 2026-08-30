@@ -12,6 +12,97 @@ DEFAULT_MAX_ACTIONS = 100
 # Logit forced onto illegal action slots before the softmax.
 ILLEGAL_LOGIT = -1e9
 
+# ── Per-action feature vector shared by the env, the trainer and the GUI bot.
+# The policy scores each candidate action as Q(state_latent, action_features)
+# instead of by its position in the 100-slot list.
+ACTION_FEATURE_DIM = 64
+_ACTION_TYPE_INDEX = {
+    "clickCard": 0,
+    "clickPrompt": 1,
+    "perCardMenuButton": 2,
+    "displayCardClick": 3,
+    "macro_resource_cards": 4,
+    "macro_select_all_cards": 5,
+    "statefulPromptResults": 6,
+    "menuButton": 7,
+}
+
+
+def build_action_features(action: dict, cost: float = 0.0) -> list[float]:
+    """Build the 64-dim feature vector describing ONE candidate action.
+
+    Layout:
+      0-7   one-hot action type
+      8-13  is_pass / is_claim / is_done / is_cancel / is_attack / is_card
+      14-19 is_leader / is_base / is_unit / is_exhausted / is_friendly / is_playable
+      20-22 is_stateful / is_macro / is_dropdown
+      23-25 card_power / card_hp / cost
+      26-41 uuid hash one-hot (16 buckets)
+      42-43 is_self_target / is_opponent_target (button targeting semantics)
+      44-63 reserved
+    """
+    vec = [0.0] * ACTION_FEATURE_DIM
+    action_type = str(action.get("actionType") or "")
+    if action_type in _ACTION_TYPE_INDEX:
+        vec[_ACTION_TYPE_INDEX[action_type]] = 1.0
+
+    features = action.get("features") or {}
+    text = f"{action.get('promptText') or action.get('description') or ''} {action.get('arg') or ''}".lower()
+
+    vec[8] = 1.0 if features.get("is_pass") or ("pass" in text and "disclose" not in text) else 0.0
+    vec[9] = 1.0 if features.get("is_claim") or "claim" in text else 0.0
+    vec[10] = 1.0 if features.get("is_done") or "done" in text else 0.0
+    vec[11] = 1.0 if "cancel" in text else 0.0
+    vec[12] = 1.0 if "attack" in text else 0.0
+    vec[13] = 1.0 if features.get("is_card") else 0.0
+    vec[14] = 1.0 if features.get("is_leader") else 0.0
+    vec[15] = 1.0 if features.get("is_base") else 0.0
+    vec[16] = 1.0 if features.get("is_unit") else 0.0
+    vec[17] = 1.0 if features.get("is_exhausted") else 0.0
+    vec[18] = 1.0 if features.get("is_friendly") else 0.0
+    vec[19] = 1.0 if action.get("playable", 1.0) else 0.0
+    vec[20] = 1.0 if features.get("is_stateful") else 0.0
+    vec[21] = 1.0 if features.get("is_macro") else 0.0
+    vec[22] = 1.0 if features.get("is_dropdown") else 0.0
+
+    vec[23] = float(features.get("card_power") or 0.0)
+    vec[24] = float(features.get("card_hp") or 0.0)
+    cost_val = action.get("cost")
+    vec[25] = float(cost_val if cost_val is not None else cost) / 10.0
+
+    uuid = str(action.get("uuid") or action.get("cardUuid") or "")
+    bucket = 0
+    if uuid:
+        try:
+            if "_" in uuid:
+                bucket = int(uuid.split("_")[1]) % 16
+            else:
+                bucket = int(uuid) % 16
+        except (ValueError, TypeError):
+            bucket = sum(map(ord, uuid)) % 16
+    vec[26 + bucket] = 1.0
+
+    # Button targeting semantics: "to yourself"/"to opponent" choices are
+    # otherwise identical menuButtons, which makes the policy coin-flip on
+    # effects like "Deal 3 indirect damage to a player".
+    vec[42] = 1.0 if (
+        features.get("is_self_target")
+        or ("yourself" in text and "opponent" not in text)
+    ) else 0.0
+    vec[43] = 1.0 if (
+        features.get("is_opponent_target")
+        or ("opponent" in text and "yourself" not in text)
+    ) else 0.0
+    return vec
+
+
+def _action_features(action: dict) -> list[float]:
+    """Stored feature vector when present, otherwise computed on the fly."""
+    stored = action.get("action_features") if isinstance(action, dict) else None
+    if isinstance(stored, (list, tuple)) and len(stored) == ACTION_FEATURE_DIM:
+        return [float(value) for value in stored]
+    return build_action_features(action or {})
+
 
 class DualHeadNetwork(nn.Module):
     """
@@ -48,6 +139,17 @@ class DualHeadNetwork(nn.Module):
         # (`state_dict["obs_encoder.0.weight"].shape[1]`) keeps working.
         self.obs_encoder = nn.Sequential(*trunk_layers)
 
+        # Q(s,a) head: score each candidate action from (state latent, action
+        # features) — action identity matters, not its position in the list.
+        self.action_head = nn.Sequential(
+            nn.Linear(input_size + ACTION_FEATURE_DIM, 128),
+            nn.GELU(),
+            nn.Linear(128, 1),
+        )
+
+        # Legacy positional head: kept so `forward()` / `evaluate()` and any
+        # external tooling that introspects `policy_head.weight` keep working.
+        # Training no longer uses it (evaluate_q / masked_logits use the Q-head).
         self.policy_head = nn.Linear(input_size, max_actions)
         self.value_head = nn.Sequential(
             nn.Linear(input_size, 128),
@@ -123,13 +225,28 @@ class TorchPolicy:
 
     def masked_logits(self, obs_tensor: torch.Tensor, available_actions=None, legal_mask=None):
         """
-        π-head logits with every unavailable action slot forced to -1e9.
+        Q(s,a) logits: score every candidate action from its feature vector.
+        Slots with no candidate / masked actions are forced to -1e9.
 
         Returns (logits [MAX_ACTIONS], state_value []).
         """
-        logits, value = self._compute_logits(obs_tensor)
-        n = len(available_actions) if available_actions is not None else self.max_actions
-        n = max(0, min(int(n), self.max_actions))  # never exceed the π-head slots
+        obs = obs_tensor.to(self.device).float().unsqueeze(0)  # [1, OBS]
+        features = self.net.obs_encoder(obs)  # [1, H]
+        n = len(available_actions) if available_actions is not None else 0
+        n = max(0, min(int(n), self.max_actions))
+
+        logits = torch.full((self.max_actions,), ILLEGAL_LOGIT, dtype=torch.float32, device=self.device)
+        value = self.net.value_head(features).squeeze(-1).squeeze(0)
+        if n == 0:
+            return logits, value
+
+        action_feats = torch.tensor(
+            [_action_features(action) for action in available_actions],
+            dtype=torch.float32,
+            device=self.device,
+        )  # [n, F]
+        q = self.net.action_head(torch.cat([features.expand(n, -1), action_feats], dim=-1)).squeeze(-1)  # [n]
+        logits[:n] = q
         mask_t = self._build_mask_tensor(n, legal_mask)
         logits = torch.where(mask_t > 0.0, logits, torch.full_like(logits, ILLEGAL_LOGIT))
         return logits, value
@@ -159,6 +276,43 @@ class TorchPolicy:
         dist = torch.distributions.Categorical(logits=logits)
         indices = action_indices.to(self.device).long()
         return dist.log_prob(indices), values
+
+    def evaluate_q(self, obs_batch: torch.Tensor, candidate_feats: list, masks: list | None = None):
+        """Q-values for a batch of steps under the CURRENT policy.
+
+        - obs_batch: [B, OBS_DIM]
+        - candidate_feats: list of B tensors, each [n_i, ACTION_FEATURE_DIM]
+          (the candidate set the agent chose among, in slot order)
+        - masks: optional list of B legal masks (numpy/int arrays of length max_actions)
+
+        Returns (q_logits [B, MAX_ACTIONS] with ILLEGAL_LOGIT on illegal slots,
+                 values [B])."""
+        obs = obs_batch.to(self.device).float()
+        features = self.net.obs_encoder(obs)  # [B, H]
+        batch_size = obs.shape[0]
+        q_logits = torch.full((batch_size, self.max_actions), ILLEGAL_LOGIT, dtype=torch.float32, device=self.device)
+        values = self.net.value_head(features).squeeze(-1)  # [B]
+
+        repeats = torch.tensor([len(f) for f in candidate_feats], device=self.device)
+        if int(repeats.sum()) > 0:
+            feat_flat = torch.cat([f.to(self.device).float() for f in candidate_feats], dim=0)
+            obs_flat = features.repeat_interleave(repeats, dim=0)  # [M, H]
+            q_flat = self.net.action_head(torch.cat([obs_flat, feat_flat], dim=-1)).squeeze(-1)  # [M]
+            offsets = torch.cat([torch.tensor([0], device=self.device), torch.cumsum(repeats, dim=0)])
+            for i in range(batch_size):
+                lo, hi = int(offsets[i]), int(offsets[i + 1])
+                if hi > lo:
+                    q_logits[i, :hi - lo] = q_flat[lo:hi]
+
+        if masks is not None:
+            for i in range(batch_size):
+                mask = masks[i]
+                if not torch.is_tensor(mask):
+                    mask = torch.tensor(mask, device=self.device)
+                else:
+                    mask = mask.to(self.device)
+                q_logits[i] = torch.where(mask > 0.0, q_logits[i], torch.full_like(q_logits[i], ILLEGAL_LOGIT))
+        return q_logits, values
 
     # ── Training ─────────────────────────────────────────────────────────────
     def update(self, logps, returns, values=None, value_coef: float = 0.5, entropy_coef: float = 0.01):
