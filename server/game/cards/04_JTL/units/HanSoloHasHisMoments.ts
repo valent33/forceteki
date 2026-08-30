@@ -21,9 +21,16 @@ export default class HanSoloHasHisMoments extends NonLeaderUnitCard {
             },
             optional: true,
             immediateEffect: AbilityHelper.immediateEffects.attack((context) => {
+                if (!context.source.isInPlay()) {
+                    // The pilot left play before this queued trigger resolved.
+                    // `parentCard` contract-asserts on a card outside play
+                    // (Null-like object value: null), so fizzle instead.
+                    return { target: null };
+                }
                 const attachedUnit = context.source.parentCard;
                 if (!attachedUnit) {
-                    return { target: context.source };  // fallback: attack with self if not piloting
+                    // Detached pilots cannot attack themselves: fizzle.
+                    return { target: null };
                 }
                 return {
                     target: attachedUnit,

@@ -29,6 +29,14 @@ export class CardAttackLastingEffectSystem<TContext extends AbilityContext = Abi
     }
 
     public override updateEvent(event: GameEvent, target: any, context: TContext, additionalProperties?: Partial<ICardAttackLastingEffectProperties>): void {
+        if (!target.isInPlay()) {
+            // The attacker left play before this lasting effect updated (e.g.
+            // defeated mid-attack while its on-attack ability resolved). An
+            // attack-lasting-effect on a dead card is moot, and reading
+            // `activeAttack` would trip the zone contract on a discard card.
+            return super.updateEvent(event, target, context, additionalProperties);
+        }
+
         Contract.assertNotNullLike(target.activeAttack, `Attempting to apply an attack lasting effect to ${target.internalName} but it is not actively attacking`);
 
         return super.updateEvent(event, target, context, additionalProperties);
