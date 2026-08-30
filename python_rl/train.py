@@ -31,7 +31,7 @@ import torch
 from swu_env import SWUEnv
 from policy import RandomActionPolicy
 from runner import EpisodeLogger
-from torch_policy import TorchPolicy
+from torch_policy import TorchPolicy, build_action_features, _action_features
 from deck_utils import load_deck
 
 try:
@@ -726,15 +726,30 @@ def _load_state_dict_any(path: str):
     return checkpoint
 
 
-def _run_worker_episode(env, policy, opponent_policy, player_id, reset_payload, max_steps):
+def _section_base_hp(section: dict | None, key: str) -> float:
+    """Remaining base HP for a seat. A destroyed base serializes as null —
+    that means 0 HP, not a default. Reading it as 30 made every game count as
+    unresolved (flat episode/win, deck report with zero wins)."""
+    try:
+        base = (section or {}).get(key, {}).get("base") or {}
+        return float(base.get("hp") or base.get("remainingHp") or base.get("currentHp") or base.get("maxHp") or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _run_worker_episode(env, policy, opponent_policy, player_id, reset_payload, max_steps,
+                        p1_key=None, p2_key=None):
     """Run one full episode.
 
-    Returns (obs_list, actions, rewards, steps, winner, agent_hp, opp_hp) for
-    the AGENT's steps only. Log-probs and values are recomputed by the main
-    process under the current policy (async-A2C correction), which also avoids
-    pickling grad-enabled tensors across process boundaries."""
+    Returns (obs_list, actions, feature_list, mask_list, rewards, steps,
+    winner, agent_hp, opp_hp, p1_key, p2_key) for the AGENT's steps only.
+    Log-probs and values are recomputed by the main process under the current
+    policy (async-A2C correction), which also avoids pickling grad-enabled
+    tensors. `p1_key` is the agent's deck key, `p2_key` the opponent's."""
     obs_list: list = []
     actions: list = []
+    feature_list: list = []
+    mask_list: list = []
     rewards: list = []
     try:
         _, info = env.reset(options=reset_payload)
@@ -768,6 +783,11 @@ def _run_worker_episode(env, policy, opponent_policy, player_id, reset_payload, 
             except Exception:
                 break
             continue
+        # Snapshot the candidate set the action was chosen from BEFORE stepping;
+        # `env.step` rebuilds `available_actions`/`legal_action_mask` for the
+        # next state, and the Q-head needs (obs_t, candidate-set_t) pairs.
+        step_candidates = list(env.available_actions[:env.max_action_space])
+        step_mask = np.asarray(env.legal_action_mask, dtype=np.int8).copy()
         try:
             _, reward, terminated, truncated, info = env.step(action)
         except Exception:
@@ -775,6 +795,11 @@ def _run_worker_episode(env, policy, opponent_policy, player_id, reset_payload, 
         if collect and logp is not None:
             obs_list.append(obs_vec.numpy().astype(np.float32))
             actions.append(int(action))
+            feature_list.append(np.asarray(
+                [_action_features(entry) for entry in step_candidates],
+                dtype=np.float32,
+            ))
+            mask_list.append(step_mask)
             rewards.append(float(reward))
         if truncated:
             break
@@ -784,13 +809,8 @@ def _run_worker_episode(env, policy, opponent_policy, player_id, reset_payload, 
     agent_key = "player1" if str(state.get("player1Id")) == str(player_id) else "player2"
     opp_key = "player2" if agent_key == "player1" else "player1"
 
-    def hp(key: str) -> float:
-        try:
-            return float((section.get(key) or {}).get("base", {}).get("hp", 30.0))
-        except Exception:
-            return 30.0
-
-    agent_hp, opp_hp = hp(agent_key), hp(opp_key)
+    agent_hp = _section_base_hp(section, agent_key)
+    opp_hp = _section_base_hp(section, opp_key)
     if agent_hp <= 0 and opp_hp > 0:
         winner = "opponent"
     elif opp_hp <= 0 and agent_hp > 0:
@@ -799,7 +819,7 @@ def _run_worker_episode(env, policy, opponent_policy, player_id, reset_payload, 
         winner = "draw"
     else:
         winner = "unresolved"
-    return obs_list, actions, rewards, step, winner, agent_hp, opp_hp
+    return obs_list, actions, feature_list, mask_list, rewards, step, winner, agent_hp, opp_hp, p1_key, p2_key
 
 
 def _parallel_worker(
@@ -853,9 +873,11 @@ def _parallel_worker(
             p1_key, p2_key = _sample_episode_decks(deck_keys)
             payload = _build_reset_payload(p1_key, p2_key, decks_file)[0]
         else:
+            p1_key = p2_key = None
             payload = copy.deepcopy(fixed_payload)
 
-        result = _run_worker_episode(env, policy, opponent, player_id, payload, max_steps)
+        result = _run_worker_episode(env, policy, opponent, player_id, payload, max_steps,
+                                     p1_key=p1_key, p2_key=p2_key)
         if result and result[0]:
             out_queue.put(result)
 
@@ -928,6 +950,7 @@ def _train_parallel(
     window_returns: list = []
     window_wins = 0.0
     window_episodes = 0
+    deck_stats: dict[str, dict[str, Any]] = {}
     perf_t0 = time.time()
     perf_steps = 0
     perf_episodes = 0
@@ -937,7 +960,7 @@ def _train_parallel(
             result = results.get(timeout=1.0)
         except queue.Empty:
             continue
-        obs_list, actions, rewards, steps, winner, agent_hp, opp_hp = result
+        obs_list, actions, feat_list, mask_list, rewards, steps, winner, agent_hp, opp_hp, p1_key, p2_key = result
         episodes_done += 1
         last_episode_number = start_episode + episodes_done
         total_steps += steps
@@ -945,14 +968,36 @@ def _train_parallel(
         perf_episodes += 1
         agent_reward = float(sum(rewards))
 
+        if p1_key:
+            st = deck_stats.setdefault(p1_key, {
+                "games": 0, "wins": 0, "losses": 0, "draws": 0, "unresolved": 0, "opponents": {},
+            })
+            st["games"] += 1
+            if winner == "agent":
+                st["wins"] += 1
+            elif winner == "opponent":
+                st["losses"] += 1
+            elif winner == "draw":
+                st["draws"] += 1
+            else:
+                st["unresolved"] += 1
+            if p2_key:
+                matchup = st["opponents"].setdefault(p2_key, [0, 0])
+                matchup[1] += 1
+                if winner == "agent":
+                    matchup[0] += 1
+
         if rewards:
             if winner == "unresolved":
                 rewards[-1] += 0.5 * (agent_hp - opp_hp) / 30.0
             returns = discounted_returns(rewards, gamma=args.gamma)
-            # Recompute log-probs and values under the CURRENT policy; workers
-            # only ship observations + actions (async-A2C correction).
+            # Recompute Q-values under the CURRENT policy from the candidate
+            # action-feature sets the worker chose among (async-A2C correction).
             obs_batch = torch.tensor(np.stack(obs_list), dtype=torch.float32)
-            logps, values = policy.evaluate(obs_batch, torch.tensor(actions, dtype=torch.long))
+            feat_tensors = [torch.tensor(feats, dtype=torch.float32) for feats in feat_list]
+            q_logits, values = policy.evaluate_q(obs_batch, feat_tensors, mask_list)
+            chosen = torch.tensor(actions, dtype=torch.long)
+            logps = q_logits.gather(1, chosen.unsqueeze(1)).squeeze(1) - torch.logsumexp(q_logits, dim=1)
             batch_logps.extend(list(logps))
             batch_returns.extend(returns)
             batch_values.extend(list(values))
@@ -970,6 +1015,8 @@ def _train_parallel(
             "winner": winner,
             "steps": steps,
             "agent_rewards": agent_reward,
+            "p1_key": p1_key,
+            "p2_key": p2_key,
         })
 
         # ── A2C update ──
@@ -1022,11 +1069,11 @@ def _train_parallel(
                       f"champion {last_tournament['champion_wins']} wins, draws {last_tournament['draws']}, "
                       f"unresolved {last_tournament['unresolved']} — candidate win rate {win_rate:.1%}")
             board.scalar("eval/candidate_win_rate", win_rate, last_episode_number)
-            if win_rate > args.promote_win_rate:
+            if win_rate >= args.promote_win_rate:
                 champion_pool.save_champion(
                     policy,
                     episode=last_episode_number,
-                    reason=f"promoted: win rate {win_rate:.1%} > {args.promote_win_rate:.1%}",
+                    reason=f"promoted: win rate {win_rate:.1%} >= {args.promote_win_rate:.1%}",
                 )
                 promotions += 1
                 if verbose:
@@ -1053,9 +1100,143 @@ def _train_parallel(
     for worker in workers:
         if worker.is_alive():
             worker.terminate()
+    _write_deck_report(log_dir, deck_stats, episodes_done)
     if verbose:
         print(f"Training finished (parallel, {args.num_workers} workers, {total_steps} steps). "
               f"Champion file: {champion_path} (promotions: {promotions})")
+
+
+# ── Deck meta report ─────────────────────────────────────────────────────────
+def _decisive(deck: dict[str, Any]) -> int:
+    return max(0, int(deck["games"]) - int(deck["unresolved"]))
+
+
+def _write_deck_report(log_dir: str, deck_stats: dict[str, dict[str, Any]], episodes: int = 0) -> None:
+    """Print + save a small deck meta report: winrate-ranked decklist and a
+    matchup matrix (agent deck rows vs opponent deck cols)."""
+    if not deck_stats:
+        print("\n[deck report] no randomized-deck episodes recorded — skipping")
+        return
+
+    def _winrate(deck: dict[str, Any]) -> float:
+        decisive = _decisive(deck)
+        return deck["wins"] / decisive if decisive > 0 else 0.0
+
+    ordered = sorted(
+        deck_stats.items(),
+        key=lambda kv: (_winrate(kv[1]), kv[1]["games"]),
+        reverse=True,
+    )
+    decks = [key for key, _ in ordered]
+
+    lines: list[str] = []
+    lines.append("DECK WINRATE REPORT (agent side; decisive = games - unresolved)")
+    lines.append("=" * 72)
+    lines.append(f"{'deck':<40}{'games':>7}{'wins':>6}{'losses':>8}{'draws':>7}{'unres':>7}{'win%':>8}")
+    for key, st in ordered:
+        lines.append(
+            f"{str(key)[:40]:<40}{st['games']:>7}{st['wins']:>6}{st['losses']:>8}"
+            f"{st['draws']:>7}{st['unresolved']:>7}{_winrate(st):>8.1%}"
+        )
+
+    # ── Matchup matrix (only decks that appeared at least once) ──
+    lines.append("")
+    lines.append("MATCHUP MATRIX — agent deck (row) vs opponent deck (col), cell = agent win% (games in parens)")
+    lines.append("=" * 72)
+    width = 22
+    header_cells = [str(key)[:width].ljust(width) for key in decks]
+    lines.append(" " * width + "".join(header_cells))
+    for row_key in decks:
+        st = deck_stats[row_key]
+        row_cells = []
+        for col_key in decks:
+            wins, games = st["opponents"].get(col_key, (0, 0))
+            if games > 0:
+                cell = f"{wins / games:.0%}({games})"[:width - 1].rjust(width - 1)
+            else:
+                cell = "-".rjust(width - 1)
+            row_cells.append(cell)
+        lines.append(str(row_key)[:width].ljust(width) + "".join(row_cells))
+
+    report_path = os.path.join(log_dir, "deck_report.txt")
+    try:
+        with open(report_path, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+    except OSError:
+        pass
+
+    # ── Console summary ──
+    print("\n[deck report] (full report saved to deck_report.txt)")
+    shown = min(12, len(ordered))
+    for key, st in ordered[:shown]:
+        print(f"  {str(key)[:40]:<40} {_winrate(st):>6.1%}  ({st['wins']}W/{st['losses']}L/{st['draws']}D, "
+              f"{st['games']} games)")
+    if len(ordered) > shown:
+        worst = ordered[-3:]
+        print(f"  ... ({len(ordered) - shown - len(worst)} more)")
+        for key, st in reversed(worst):
+            print(f"  {str(key)[:40]:<40} {_winrate(st):>6.1%}  ({st['wins']}W/{st['losses']}L/{st['draws']}D, "
+                  f"{st['games']} games)")
+
+    # ── CSV for pivoting ──
+    csv_path = os.path.join(log_dir, "deck_matchups.csv")
+    try:
+        with open(csv_path, "w", encoding="utf-8") as handle:
+            handle.write("agent_deck,opponent_deck,games,agent_wins,winrate\n")
+            for key, st in ordered:
+                for opp_key, (wins, games) in sorted(st["opponents"].items(), key=lambda kv: -kv[1][1]):
+                    if games > 0:
+                        handle.write(f"{key},{opp_key},{games},{wins},{wins / games:.3f}\n")
+    except OSError:
+        pass
+
+    # ── Heatmap PNG (optional; skipped when matplotlib is missing or too many decks) ──
+    if len(decks) < 2:
+        return
+    if len(decks) > 90:
+        print(f"[deck report] matrix too large for a readable heatmap ({len(decks)} decks) — text + CSV only")
+        return
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return
+
+    try:
+        import numpy as _np
+        matrix = _np.full((len(decks), len(decks)), _np.nan)
+        for row_idx, row_key in enumerate(decks):
+            st = deck_stats[row_key]
+            for col_idx, col_key in enumerate(decks):
+                wins, games = st["opponents"].get(col_key, (0, 0))
+                if games > 0:
+                    matrix[row_idx, col_idx] = wins / games
+        size = max(8.0, len(decks) * 0.35)
+        fig, ax = plt.subplots(figsize=(size, size * 0.92))
+        cmap = plt.get_cmap("RdYlGn").copy()
+        cmap.set_bad("#dddddd")
+        image = ax.imshow(matrix, cmap=cmap, vmin=0.0, vmax=1.0, aspect="auto")
+        ax.set_xticks(range(len(decks)))
+        ax.set_yticks(range(len(decks)))
+        ax.set_xticklabels(decks, rotation=90, fontsize=max(4.0, 140.0 / size))
+        ax.set_yticklabels(decks, fontsize=max(4.0, 140.0 / size))
+        if len(decks) <= 24:
+            for row_idx in range(len(decks)):
+                for col_idx in range(len(decks)):
+                    value = matrix[row_idx, col_idx]
+                    if not _np.isnan(value):
+                        ax.text(col_idx, row_idx, f"{value:.0%}",
+                                ha="center", va="center", fontsize=max(4.0, 110.0 / size))
+        ax.set_title(f"Deck matchup win-rate (agent rows vs opponent cols) — {episodes} episodes")
+        fig.colorbar(image, ax=ax, shrink=0.8, label="agent win rate")
+        fig.tight_layout()
+        heatmap_path = os.path.join(log_dir, "deck_heatmap.png")
+        fig.savefig(heatmap_path, dpi=150)
+        plt.close(fig)
+        print(f"[deck report] heatmap saved to deck_heatmap.png ({len(decks)}x{len(decks)})")
+    except Exception as exc:  # never let a report crash training
+        print(f"[deck report] heatmap rendering failed: {exc}")
 
 
 # ── Main training loop ───────────────────────────────────────────────────────

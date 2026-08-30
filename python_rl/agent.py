@@ -733,6 +733,45 @@ class QueueBotClient:
                 "description": f"statefulPromptResults {distribution.get('type')}",
             }
 
+        if "disclose" in prompt_title:
+            # Optional disclosures ("...you may choose nothing") are always
+            # legal via the Choose-nothing button — prefer it; it matches the
+            # training env's single macro action.
+            for button in prompt_state.get("buttons") or []:
+                if button.get("disabled"):
+                    continue
+                if "choose nothing" in str(button.get("text", "")).strip().lower():
+                    return {
+                        "kind": "menuButton",
+                        "actionType": "clickPrompt",
+                        "arg": button.get("arg", "done"),
+                        "uuid": prompt_uuid,
+                        "method": button.get("command") or "menuButton",
+                        "description": button.get("text", "Choose nothing"),
+                    }
+            # Non-optional disclosure: click the first not-yet-selected card,
+            # then Done.
+            unselected = [card for card in self._collect_selectable_cards(state) if not card.get("selected")]
+            if unselected:
+                card = unselected[0]
+                return {
+                    "kind": "cardClicked",
+                    "actionType": "clickCard",
+                    "cardUuid": card.get("uuid"),
+                    "description": f"disclose {card.get('name') or card.get('uuid')}",
+                }
+            for button in prompt_state.get("buttons") or []:
+                if not button.get("disabled") and str(button.get("arg", "")).strip().lower() == "done":
+                    return {
+                        "kind": "menuButton",
+                        "actionType": "clickPrompt",
+                        "arg": button.get("arg", "done"),
+                        "uuid": prompt_uuid,
+                        "method": button.get("command") or "menuButton",
+                        "description": button.get("text", "done"),
+                    }
+            return None
+
         candidates = self._build_candidates(state, prompt_state)
         if candidates:
             if prompt_state.get("promptType") == "resource":
@@ -795,6 +834,28 @@ class QueueBotClient:
         selectable_cards = self._collect_selectable_cards(state)
         selected_cards = prompt_state.get("selectedCards") or []
 
+        # Number prompts (e.g. "Choose a number"): offer each value as a
+        # menuButton — the GUI server routes them like button presses.
+        if prompt_state.get("promptType") == "number" or "selectNumber" in prompt_state:
+            select_number = prompt_state.get("selectNumber") or {}
+            lo = select_number.get("min", select_number.get("minimum"))
+            hi = select_number.get("max", select_number.get("maximum"))
+            try:
+                lo, hi = int(lo), int(hi)
+            except (TypeError, ValueError):
+                lo, hi = None, None
+            if lo is not None and hi is not None and hi >= lo:
+                for value in range(lo, hi + 1)[:12]:
+                    candidates.append({
+                        "kind": "menuButton",
+                        "actionType": "clickPrompt",
+                        "arg": str(value),
+                        "uuid": prompt_uuid,
+                        "method": "menuButton",
+                        "description": f"number {value}",
+                    })
+            return self._annotate_candidates(state, prompt_state, candidates)
+
         if prompt_state.get("promptType") == "resource":
             resource_candidates = self._build_resource_candidates(prompt_state, selectable_cards)
             if resource_candidates:
@@ -828,6 +889,8 @@ class QueueBotClient:
         # Buttons first — the RL env action builder appends buttons before
         # card clicks, and the policy head's 100 slots are positional, so the
         # GUI candidate order must match training order.
+        prompt_title_lower = str(prompt_state.get("menuTitle") or "").lower()
+        deferred_self_damage_buttons = []
         for button in buttons:
             command = button.get("command") or "menuButton"
             button_text = str(button.get("text", "")).strip().lower()
@@ -836,14 +899,23 @@ class QueueBotClient:
             # training env) — the agent must commit to the action it picked.
             if "cancel" in button_text or "cancel" in button_arg:
                 continue
-            candidates.append({
+            # The server explicitly marks these as doing nothing.
+            if button_text.startswith("(no effect)") or "(no effect)" in button_text:
+                continue
+            button_candidate = {
                 "kind": command,
                 "actionType": "clickPrompt",
                 "arg": button.get("arg", ""),
                 "uuid": prompt_uuid,
                 "method": command,
                 "description": button.get("text", "button"),
-            })
+            }
+            # "Deal X damage to yourself" is strictly worse than targeting the
+            # opponent — only offer it if the prompt has no other action.
+            if "damage" in prompt_title_lower and "yourself" in button_text:
+                deferred_self_damage_buttons.append(button_candidate)
+                continue
+            candidates.append(button_candidate)
 
         if display_cards:
             if per_card_buttons:
@@ -857,6 +929,7 @@ class QueueBotClient:
                             "uuid": prompt_uuid,
                             "method": button.get("command") or "perCardMenuButton",
                             "description": f"{button.get('text', 'button')} on {card.get('name') or card.get('internalName') or card.get('cardUuid')}",
+                            "features": {"is_card": 1.0},
                         })
             else:
                 for card in display_cards:
@@ -867,6 +940,8 @@ class QueueBotClient:
                         "uuid": prompt_uuid,
                         "method": "menuButton",
                         "description": f"select card {card.get('name') or card.get('internalName') or card.get('cardUuid')}",
+                        "cardUuid": card.get("cardUuid"),
+                        "features": {"is_card": 1.0},
                     })
 
         if prompt_state.get("promptType") == "resource" and selected_cards:
@@ -874,11 +949,25 @@ class QueueBotClient:
             selectable_cards = [card for card in selectable_cards if card.get("uuid") not in selected_uuids]
 
         for card in selectable_cards:
+            db_card = _card_db_by_id().get(str(card.get("id"))) or {}
+            zone = str(card.get("zone") or "").lower()
+            friendly = str(card.get("controllerId")) == str(self.player_id)
             candidates.append({
                 "kind": "cardClicked",
                 "actionType": "clickCard",
                 "cardUuid": card.get("uuid"),
                 "description": card.get("name") or card.get("internalName") or card.get("uuid", "card"),
+                "cost": float(db_card.get("cost") or 0.0),
+                "features": {
+                    "is_card": 1.0,
+                    "is_friendly": 1.0 if friendly else 0.0,
+                    "is_leader": 1.0 if zone == "leader" else 0.0,
+                    "is_base": 1.0 if zone == "base" else 0.0,
+                    "is_unit": 1.0 if card.get("power") is not None else 0.0,
+                    "is_exhausted": 1.0 if card.get("exhausted") else 0.0,
+                    "card_power": float(card.get("power") or 0.0) / 10.0,
+                    "card_hp": float(card.get("hp") or 0.0) / 20.0,
+                },
             })
 
         for option in dropdown_options:
@@ -890,6 +979,9 @@ class QueueBotClient:
                 "method": "menuButton",
                 "description": f"dropdown {option}",
             })
+
+        if not candidates and deferred_self_damage_buttons:
+            candidates.extend(deferred_self_damage_buttons)
 
         return self._annotate_candidates(state, prompt_state, candidates)
 
@@ -983,6 +1075,8 @@ class QueueBotClient:
             "is_unit": 0.0,
             "card_power": 0.0,
             "card_hp": 0.0,
+            "is_self_target": 1.0 if "yourself" in description else 0.0,
+            "is_opponent_target": 1.0 if "opponent" in description else 0.0,
         }
 
         if card:
@@ -992,8 +1086,9 @@ class QueueBotClient:
             features["is_base"] = 1.0 if card_data.get("cardType") == "base" else 0.0
             features["is_exhausted"] = 1.0 if card_data.get("exhausted") else 0.0
             features["is_unit"] = 1.0 if card_data.get("cardType") == "unit" else 0.0
-            features["card_power"] = float(card_data.get("power") or card_data.get("printedPower") or 0.0)
-            features["card_hp"] = float(card_data.get("hp") or card_data.get("remainingHp") or card_data.get("currentHp") or 0.0)
+            # Same normalization as the training env (power/10, hp/20).
+            features["card_power"] = float(card_data.get("power") or card_data.get("printedPower") or 0.0) / 10.0
+            features["card_hp"] = float(card_data.get("hp") or card_data.get("remainingHp") or card_data.get("currentHp") or 0.0) / 20.0
 
         return features
 
@@ -1340,17 +1435,38 @@ class QueueBotClient:
         if not chosen_cards:
             return None
 
-        base_amount = amount // len(chosen_cards)
-        remainder = amount % len(chosen_cards)
+        # Absorb the damage on the highest-remaining-HP target first (usually
+        # a base at 25-30 HP): concentrating damage minimizes unit losses.
+        def _card_hp(card: dict[str, Any]) -> float:
+            try:
+                return float(card.get("hp") or card.get("remainingHp") or card.get("currentHp") or 0.0)
+            except Exception:
+                return 0.0
+
+        candidate_cards.sort(key=_card_hp, reverse=True)
+        is_indirect_damage = distribution_type == "distributeIndirectDamage"
         value_distribution = []
-        for index, card in enumerate(chosen_cards):
-            card_amount = base_amount + (1 if index < remainder else 0)
-            if card_amount > 0:
-                value_distribution.append({"uuid": card.get("uuid"), "amount": card_amount})
+        remaining = int(amount)
+        for card in candidate_cards:
+            if remaining <= 0:
+                break
+            if max_targets is not None and len(value_distribution) >= int(max_targets):
+                break
+            cap = remaining
+            if is_indirect_damage:
+                hp = _card_hp(card)
+                if hp > 0:
+                    cap = min(cap, int(hp))
+            if cap <= 0:
+                continue
+            value_distribution.append({"uuid": card.get("uuid"), "amount": cap})
+            remaining -= cap
+
+        if remaining > 0 and not distribute_prompt.get("canDistributeLess"):
+            return None
 
         if not value_distribution and not distribute_prompt.get("canChooseNoTargets"):
-            first_card = chosen_cards[0]
-            value_distribution = [{"uuid": first_card.get("uuid"), "amount": amount}]
+            return None
 
         return {
             "type": distribution_type,

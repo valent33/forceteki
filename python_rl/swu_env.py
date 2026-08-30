@@ -13,6 +13,8 @@ import requests
 import sys as _sys
 from gymnasium import spaces
 
+from torch_policy import build_action_features
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Star Wars: Unlimited domain dictionaries (Forceteki card data)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -228,6 +230,35 @@ class SWUEnv(gym.Env):
         self._update_available_actions()
         return self._get_obs(), self._get_info()
 
+    def _post_step(self, payload):
+        """POST /step and return the resulting state dict.
+
+        Contract assertions (HTTP 500, e.g. a stale card click whose prompt
+        already resolved) must not kill the episode: on any transport/HTTP
+        failure we resync from /state and return that instead. Returns None
+        only if the server itself is unreachable."""
+        try:
+            resp = requests.post(f"{self.server_url}/step", json=payload)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception:
+            try:
+                state_resp = requests.get(f"{self.server_url}/state")
+                state_resp.raise_for_status()
+                return state_resp.json()
+            except Exception:
+                return None
+
+    def _prompt_sig(self, state, player_id):
+        """(promptUuid, menuTitle) of *player_id*'s prompt — used to detect
+        prompt advancement between the posts of a multi-click macro."""
+        seat = "player1" if str(state.get("player1Id")) == str(player_id) else "player2"
+        prompt = (state.get("prompts") or {}).get(seat) or {}
+        return (str(prompt.get("promptUuid")), str(prompt.get("menuTitle", "")))
+
+    def _seat_for(self, state, player_id):
+        return "player1" if str(state.get("player1Id")) == str(player_id) else "player2"
+
     def step(self, action_index):
         # Prevent invalid out-of-bounds actions
         if action_index >= len(self.available_actions):
@@ -250,9 +281,11 @@ class SWUEnv(gym.Env):
                 "promptText": action_dict.get("promptText", ""),
                 "result": action_dict.get("result"),
             }
-            resp = requests.post(f"{self.server_url}/step", json=payload)
-            resp.raise_for_status()
-            self.current_state = resp.json()
+            data = self._post_step(payload)
+            if data is None:
+                self.current_state = prev_state
+            else:
+                self.current_state = data
             reward = self._shape_reward(prev_state, self.current_state, action_dict)
             terminated = False
             truncated = False
@@ -292,49 +325,59 @@ class SWUEnv(gym.Env):
             return self._get_obs(), reward, terminated, truncated, self._get_info()
 
         if action_dict["actionType"] == "macro_resource_cards":
-            # 1. Click the cards
+            player_id = str(action_dict.get("playerId", self.player_id))
+            # 1. Click the cards. Stop early if the prompt advances or errors —
+            #    leftover clicks would hit a different step and trip contract
+            #    assertions on the server.
             for uid in action_dict.get("uuids", []):
                 payload_card = {
-                    "playerId": action_dict.get("playerId", self.player_id),
+                    "playerId": player_id,
                     "action": "clickCard",
                     "arg": "any",
                     "uuid": uid,
                     "method": "undefined",
                     "promptText": ""
                 }
-                requests.post(f"{self.server_url}/step", json=payload_card).raise_for_status()
-
-            # 2. Refresh and click the actual Done button metadata from current prompt.
-            # Some prompts require specific arg/uuid/method values and can stall otherwise.
-            state_resp = requests.get(f"{self.server_url}/state")
-            state_resp.raise_for_status()
-            state = state_resp.json()
-
-            p_key = "player1" if action_dict.get("playerId") == "111" else "player2"
-            prompt = (state.get("prompts") or {}).get(p_key) or {}
-            done_btn = None
-            for btn in prompt.get("buttons", []):
-                text = str(btn.get("text", "")).strip().lower()
-                arg = str(btn.get("arg", "")).strip().lower()
-                if text == "done" or arg == "done":
-                    done_btn = btn
+                data = self._post_step(payload_card)
+                if data is None:
+                    self.current_state = prev_state
+                    break
+                self.current_state = data
+                if "error" in data:
                     break
 
+            # 2. Resync, then click Done with fresh metadata from the CURRENT
+            # prompt. Some prompts require specific arg/uuid/method values and
+            # can stall otherwise.
+            state = self.current_state
+            if "error" not in state:
+                try:
+                    state_resp = requests.get(f"{self.server_url}/state")
+                    state_resp.raise_for_status()
+                    state = state_resp.json()
+                    self.current_state = state
+                except Exception:
+                    pass
+
+            p_key = self._seat_for(state, player_id)
+            prompt = (state.get("prompts") or {}).get(p_key) or {}
+            done_btn = next(
+                (b for b in prompt.get("buttons", [])
+                 if not b.get("disabled") and str(b.get("arg", "")).strip().lower() == "done"),
+                None,
+            )
             if done_btn is not None:
                 payload_done = {
-                    "playerId": action_dict.get("playerId", self.player_id),
-                    "action": "clickPrompt",
+                    "playerId": player_id,
+                    "action": "menuButton",
                     "arg": done_btn.get("arg", "done"),
-                    "uuid": done_btn.get("uuid", ""),
+                    "uuid": done_btn.get("uuid") or prompt.get("promptUuid", ""),
                     "method": done_btn.get("command", "menuButton"),
                     "promptText": done_btn.get("text", "Done")
                 }
-                resp = requests.post(f"{self.server_url}/step", json=payload_done)
-                resp.raise_for_status()
-                self.current_state = resp.json()
-            else:
-                # If there is no done button anymore, card clicks likely auto-submitted.
-                self.current_state = state
+                data = self._post_step(payload_done)
+                if data is not None:
+                    self.current_state = data
         elif action_dict.get("actionType") == "perCardMenuButton":
             payload = {
                 "playerId": action_dict.get("playerId", self.player_id),
@@ -345,9 +388,9 @@ class SWUEnv(gym.Env):
                 "method": "menuButton",
                 "promptText": "",
             }
-            resp = requests.post(f"{self.server_url}/step", json=payload)
-            resp.raise_for_status()
-            self.current_state = resp.json()
+            data = self._post_step(payload)
+            if data is not None:
+                self.current_state = data
         elif action_dict.get("actionType") == "displayCardClick":
             # DisplayCardsForSelectionPrompt (deck/trash/search) expects menuButton,
             # not cardClicked. Send a non-clickCard action so the server routes
@@ -361,23 +404,84 @@ class SWUEnv(gym.Env):
                 "method": "menuButton",
                 "promptText": "",
             }
-            resp = requests.post(f"{self.server_url}/step", json=payload)
-            resp.raise_for_status()
-            self.current_state = resp.json()
+            data = self._post_step(payload)
+            if data is not None:
+                self.current_state = data
+        elif action_dict.get("actionType") == "macro_select_all_cards":
+            # Disclose-style prompt: click offered cards until the prompt
+            # advances (or errors), then press Done from the CURRENT prompt.
+            player_id = str(action_dict.get("playerId", self.player_id))
+            before_sig = self._prompt_sig(self.current_state, player_id)
+            clicked_any = False
+            for uid in action_dict.get("uuids", []):
+                payload_card = {
+                    "playerId": player_id,
+                    "action": "clickCard",
+                    "arg": "any",
+                    "uuid": uid,
+                    "method": "undefined",
+                    "promptText": "",
+                }
+                data = self._post_step(payload_card)
+                if data is None:
+                    break
+                self.current_state = data
+                clicked_any = True
+                if "error" in data or self._prompt_sig(data, player_id) != before_sig:
+                    # Single-select prompts auto-advance after the first click;
+                    # multi-select prompts keep the same signature and need all.
+                    break
+
+            state = self.current_state
+            if action_dict.get("doneArg") is not None:
+                p_key = self._seat_for(state, player_id)
+                prompt = (state.get("prompts") or {}).get(p_key) or {}
+                done_btn = next(
+                    (b for b in prompt.get("buttons", [])
+                     if not b.get("disabled") and str(b.get("arg", "")).strip().lower() == "done"),
+                    None,
+                )
+                if done_btn is not None:
+                    payload_done = {
+                        "playerId": player_id,
+                        "action": "menuButton",
+                        "arg": done_btn.get("arg", "done"),
+                        "uuid": done_btn.get("uuid") or prompt.get("promptUuid", ""),
+                        "method": done_btn.get("command", "menuButton"),
+                        "promptText": done_btn.get("text", "Done"),
+                    }
+                    data = self._post_step(payload_done)
+                    if data is not None:
+                        self.current_state = data
+            elif not clicked_any:
+                # Nothing to click (e.g. the list was empty): just resync.
+                try:
+                    state_resp = requests.get(f"{self.server_url}/state")
+                    state_resp.raise_for_status()
+                    self.current_state = state_resp.json()
+                except Exception:
+                    pass
         else:
+            # Generic actions (clickPrompt, clickCard, menuButton…).
+            # Buttons are routed as `menuButton` with the button's arg + the
+            # prompt's uuid — the engine dispatches by (uuid, arg), exactly how
+            # the GUI client sends button presses. A stale click (prompt already
+            # advanced) then becomes a harmless no-op instead of the server
+            # raising TestSetupError on its text-based button lookup.
+            action_type = action_dict.get("actionType", "menuButton")
             payload = {
                 "playerId": action_dict.get("playerId", self.player_id),
-                "action": action_dict["actionType"],
-                "arg": action_dict.get("arg", "menuButton"),
-                "uuid": action_dict.get("uuid"),
-                "method": action_dict.get("method"),
-                "promptText": action_dict.get("promptText")
+                "action": "menuButton" if action_type in ("clickPrompt", "menuButton") else action_type,
+                "arg": action_dict.get("arg", "any"),
+                "uuid": action_dict.get("uuid", ""),
+                "method": action_dict.get("method", "menuButton"),
+                "promptText": action_dict.get("promptText", ""),
             }
 
             # Issue the action
-            resp = requests.post(f"{self.server_url}/step", json=payload)
-            resp.raise_for_status()
-            self.current_state = resp.json()
+            data = self._post_step(payload)
+            if data is not None:
+                self.current_state = data
 
         # Track consumed card UUID — prevents re-selection in multi-select prompts.
         if action_dict.get("actionType") in {"clickCard", "displayCardClick"} and action_dict.get("uuid"):
@@ -410,11 +514,19 @@ class SWUEnv(gym.Env):
         truncated = False
 
         if "error" in self.current_state:
-            # print(f"Error on step: {self.current_state['error']}")
-            # Treat server crash/illegal logic failure as an episode end
-            terminated = True
-            reward = -10.0
-        else:
+            # Contract assertions on stale actions return {"error": ...}: the
+            # game itself is still alive. Resync from /state and keep going
+            # with a small penalty — only a dead server ends the episode.
+            try:
+                state_resp = requests.get(f"{self.server_url}/state")
+                state_resp.raise_for_status()
+                self.current_state = state_resp.json()
+                terminated = False
+                reward = -0.5
+            except Exception:
+                terminated = True
+                reward = -10.0
+        if not terminated:
             # check the winners field outputted by the server
             winners = self.current_state.get("winners", [])
             if len(winners) > 0:
@@ -496,7 +608,7 @@ class SWUEnv(gym.Env):
                     if not isinstance(card, dict):
                         continue
                     selection_state = str(card.get("selectionState", "")).lower()
-                    if selection_state not in {"viewonly", "invalid", "unselectable"}:
+                    if selection_state not in {"viewonly", "invalid", "unselectable", "selected"}:
                         return True
 
                 return False
@@ -597,47 +709,65 @@ class SWUEnv(gym.Env):
             player_prompt and player_prompt.get("promptType") == "distributeAmongTargets" and player_prompt.get("distributeAmongTargets")
         )
 
+        deferred_self_damage_buttons: list[dict[str, Any]] = []
+
         if has_buttons or has_dropdowns or len(selectable_uuids) > 0 or len(display_cards) > 0:
             self.active_player = p_id
             self.active_players.append(p_id)
 
-            if has_buttons and not is_stateful_distribution_prompt:
-                for btn in player_prompt["buttons"]:
-                    if not btn.get("disabled", False):
-                        btn_arg = str(btn.get("arg", "")).strip().lower()
-                        btn_text = str(btn.get("text", "")).strip().lower()
-                        # Cancel is a zero-progress no-op: never offer it. If the
-                        # agent picked a cancellable action it must commit to it
-                        # (or pick something else) instead of undoing it.
-                        if "cancel" in btn_arg or "cancel" in btn_text:
-                            continue
-                        # structured numeric features for the policy
-                        features = {
-                            "is_stateful": 0.0,
-                            "is_macro": 0.0,
-                            "is_dropdown": 1.0 if btn.get("command") == "menuButton" else 0.0,
-                            "is_done": 1.0 if btn_arg == "done" else 0.0,
-                            "is_claim": 1.0 if ("claim" in btn_arg or "claim" in btn_text) else 0.0,
-                            "is_pass": 1.0 if ("pass" in btn_arg or "pass" in btn_text) else 0.0,
-                            "is_card": 0.0,
-                            "is_friendly": 0.0,
-                            "is_leader": 0.0,
-                            "is_base": 0.0,
-                            "is_exhausted": 0.0,
-                            "is_unit": 0.0,
-                            "card_power": 0.0,
-                            "card_hp": 0.0,
-                        }
+            # Buttons that target yourself with damage are strictly worse than
+            # targeting the opponent ("Deal 3 indirect damage to a player").
+            # Build them but only offer them if the prompt has no other action.
+            deferred_self_damage_buttons = []
 
-                        self.available_actions.append({
-                            "playerId": p_id,
-                            "actionType": "clickPrompt",
-                            "arg": btn.get("arg"),
-                            "uuid": btn.get("uuid", ""),
-                            "method": btn.get("command"),
-                            "promptText": btn.get("text"),
-                            "features": features,
-                        })
+            if has_buttons and not is_stateful_distribution_prompt:
+                title_lower = str(menu_title or "").lower()
+                for btn in player_prompt["buttons"]:
+                    if btn.get("disabled", False):
+                        continue
+                    btn_arg = str(btn.get("arg", "")).strip().lower()
+                    btn_text = str(btn.get("text", "")).strip().lower()
+                    # Cancel is a zero-progress no-op: never offer it. If the
+                    # agent picked a cancellable action it must commit to it
+                    # (or pick something else) instead of undoing it.
+                    if "cancel" in btn_arg or "cancel" in btn_text:
+                        continue
+                    # The server explicitly marks these as doing nothing.
+                    if btn_text.startswith("(no effect)") or "(no effect)" in btn_text:
+                        continue
+                    # structured numeric features for the policy
+                    features = {
+                        "is_stateful": 0.0,
+                        "is_macro": 0.0,
+                        "is_dropdown": 1.0 if btn.get("command") == "menuButton" else 0.0,
+                        "is_done": 1.0 if btn_arg == "done" else 0.0,
+                        "is_claim": 1.0 if ("claim" in btn_arg or "claim" in btn_text) else 0.0,
+                        "is_pass": 1.0 if ("pass" in btn_arg or "pass" in btn_text) else 0.0,
+                        "is_card": 0.0,
+                        "is_friendly": 0.0,
+                        "is_leader": 0.0,
+                        "is_base": 0.0,
+                        "is_exhausted": 0.0,
+                        "is_unit": 0.0,
+                        "card_power": 0.0,
+                        "card_hp": 0.0,
+                        "is_self_target": 1.0 if "yourself" in btn_text else 0.0,
+                        "is_opponent_target": 1.0 if "opponent" in btn_text else 0.0,
+                    }
+
+                    btn_action = {
+                        "playerId": p_id,
+                        "actionType": "clickPrompt",
+                        "arg": btn.get("arg"),
+                        "uuid": btn.get("uuid") or player_prompt.get("promptUuid", ""),
+                        "method": btn.get("command"),
+                        "promptText": btn.get("text"),
+                        "features": features,
+                    }
+                    if "damage" in title_lower and "yourself" in btn_text:
+                        deferred_self_damage_buttons.append(btn_action)
+                        continue
+                    self.available_actions.append(btn_action)
 
             if has_dropdowns:
                 dropdown_options = list(player_prompt["dropdownListOptions"])
@@ -702,7 +832,7 @@ class SWUEnv(gym.Env):
                             "is_done": 0.0,
                             "is_claim": 0.0,
                             "is_pass": 0.0,
-                            "is_card": 0.0,
+                            "is_card": 1.0,
                             "is_friendly": 1.0,
                             "is_leader": 0.0,
                             "is_base": 0.0,
@@ -717,6 +847,7 @@ class SWUEnv(gym.Env):
                             "uuids": [card["uuid"]],
                             "arg": "any",
                             "internalName": card.get("internalName", "Unknown"),
+                            "cost": float(self._card_data(card.get("internalName")).get("cost") or 0.0),
                             "features": features,
                         })
                     else:
@@ -727,7 +858,7 @@ class SWUEnv(gym.Env):
                             "is_done": 0.0,
                             "is_claim": 0.0,
                             "is_pass": 0.0,
-                            "is_card": 0.0,
+                            "is_card": 1.0,
                             "is_friendly": 1.0,
                             "is_leader": 0.0,
                             "is_base": 0.0,
@@ -742,6 +873,7 @@ class SWUEnv(gym.Env):
                             "uuids": [group[0]["uuid"], group[1]["uuid"]],
                             "arg": "any",
                             "internalName": f"{group[0].get('internalName', 'Unknown')} + {group[1].get('internalName', 'Unknown')}",
+                            "cost": sum(float(self._card_data(card.get("internalName")).get("cost") or 0.0) for card in group),
                             "features": features,
                         })
             elif (len(selectable_uuids) > 0 or len(display_cards) > 0) and self.current_state.get("state") and p_key in self.current_state["state"] and not is_stateful_distribution_prompt:
@@ -900,8 +1032,9 @@ class SWUEnv(gym.Env):
                     selection_state = str(display_card.get("selectionState", "")).lower()
                     # `unselectable` cards (e.g. L3-37 droids that would exceed
                     # the combined cost) are shown but NOT clickable — the
-                    # server ignores clicks on them.
-                    if selection_state in {"viewonly", "invalid", "unselectable"}:
+                    # server ignores clicks on them. Already-selected cards are
+                    # excluded too so the policy can't toggle selections forever.
+                    if selection_state in {"viewonly", "invalid", "unselectable", "selected"}:
                         continue
 
                     display_uuid = display_card.get("cardUuid") or display_card.get("uuid")
@@ -1128,6 +1261,97 @@ class SWUEnv(gym.Env):
             #    contract assertion ("...not supported by the current step") and
             #    corrupts the game. Zero actions lets the caller poll and abort
             #    the episode via the stall guard instead of crashing the server.
+
+        # ── Disclose prompts: the server lists every card that may be disclosed.
+        # When the disclosure is optional ("you may choose nothing"), the
+        # 'Choose nothing' button is always legal and avoids multi-click races;
+        # prefer it. Otherwise collapse the selection into one macro action so
+        # the policy doesn't have to click cards one by one.
+        if "disclose" in str(menu_title or "").lower():
+            buttons_now = player_prompt.get("buttons") or []
+            choose_nothing = next(
+                (b for b in buttons_now
+                 if not b.get("disabled") and "choose nothing" in str(b.get("text", "")).strip().lower()),
+                None,
+            )
+            if choose_nothing is not None:
+                self.available_actions = [{
+                    "playerId": p_id,
+                    "actionType": "clickPrompt",
+                    "arg": choose_nothing.get("arg", "done"),
+                    "uuid": choose_nothing.get("uuid") or player_prompt.get("promptUuid", ""),
+                    "method": choose_nothing.get("command", "menuButton"),
+                    "promptText": choose_nothing.get("text", "Choose nothing"),
+                    "internalName": "disclose choose nothing",
+                    "features": {
+                        "is_stateful": 0.0,
+                        "is_macro": 0.0,
+                        "is_dropdown": 0.0,
+                        "is_done": 1.0,
+                        "is_claim": 0.0,
+                        "is_pass": 0.0,
+                        "is_card": 0.0,
+                        "is_friendly": 0.0,
+                        "is_leader": 0.0,
+                        "is_base": 0.0,
+                        "is_exhausted": 0.0,
+                        "is_unit": 0.0,
+                        "card_power": 0.0,
+                        "card_hp": 0.0,
+                    },
+                }]
+            else:
+                disclose_uuids = [u for u in (selectable_uuids or []) if u not in self._consumed_card_uuids]
+                done_btn = next(
+                    (b for b in buttons_now
+                     if not b.get("disabled") and str(b.get("arg", "")).strip().lower() == "done"),
+                    None,
+                )
+                if disclose_uuids or done_btn is not None:
+                    self.available_actions = [{
+                        "playerId": p_id,
+                        "actionType": "macro_select_all_cards",
+                        "uuids": list(disclose_uuids),
+                        "doneArg": done_btn.get("arg") if done_btn else None,
+                        "doneText": done_btn.get("text") if done_btn else None,
+                        "uuid": player_prompt.get("promptUuid", ""),
+                        "internalName": f"disclose {len(disclose_uuids)} card(s)",
+                        "features": {
+                            "is_stateful": 1.0,
+                            "is_macro": 1.0,
+                            "is_dropdown": 0.0,
+                            "is_done": 0.0,
+                            "is_claim": 0.0,
+                            "is_pass": 0.0,
+                            "is_card": 0.0,
+                            "is_friendly": 0.0,
+                            "is_leader": 0.0,
+                            "is_base": 0.0,
+                            "is_exhausted": 0.0,
+                            "is_unit": 0.0,
+                            "card_power": 0.0,
+                            "card_hp": 0.0,
+                        },
+                    }]
+
+        # ── Attach per-action feature vectors for the Q(s,a) policy head ─────
+        # Strict-dominance fallback: self-damage buttons are only offered when
+        # the prompt has no other action at all.
+        if not self.available_actions and deferred_self_damage_buttons:
+            self.available_actions = list(deferred_self_damage_buttons)
+
+        ready_resources = 0.0
+        state_section = self.current_state.get("state") or {}
+        if state_section and p_key in state_section:
+            ready_resources = self._num(state_section[p_key], "readyResourceCount")
+        for action in self.available_actions:
+            cost = 0.0
+            if action.get("actionType") == "clickCard" and action.get("internalName"):
+                cost = float(self._card_data(action.get("internalName")).get("cost") or 0.0)
+                action["playable"] = 1.0 if cost <= ready_resources + 1e-6 else 0.0
+            else:
+                action["playable"] = 1.0
+            action["action_features"] = build_action_features(action, cost=cost)
 
         # ── Hard safety cap ──────────────────────────────────────────────────
         # The policy head has exactly `max_action_space` slots, so the flat
@@ -2006,14 +2230,9 @@ class SWUEnv(gym.Env):
 
         remaining = int(amount)
         max_targets = distribute_prompt.get("maxTargets")
-        # Prefer units with more remaining HP so we avoid overfilling low-HP units.
-        candidate_cards.sort(
-            key=lambda card: (
-                1 if _is_unit(card) else 0,
-                _remaining_hp(card) if _is_unit(card) else 0.0,
-            ),
-            reverse=True,
-        )
+        # Absorb the damage on the highest-remaining-HP targets first (typically
+        # a base at 25-30 HP): concentrating damage minimizes unit losses.
+        candidate_cards.sort(key=lambda card: _remaining_hp(card), reverse=True)
 
         is_indirect_damage = distribution_type == "distributeIndirectDamage"
 
