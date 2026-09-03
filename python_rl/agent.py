@@ -716,7 +716,7 @@ class QueueBotClient:
 
     def _choose_action(self, state: dict[str, Any], prompt_state: dict[str, Any]) -> dict[str, Any] | None:
         import time
-        time.sleep(0.5)
+        # time.sleep(0.5)
         
         prompt_type = prompt_state.get("promptType")
         prompt_uuid = prompt_state.get("promptUuid")
@@ -775,9 +775,9 @@ class QueueBotClient:
         candidates = self._build_candidates(state, prompt_state)
         if candidates:
             if prompt_state.get("promptType") == "resource":
-                resource_candidates = [candidate for candidate in candidates if candidate.get("kind") == "macro_resource_cards"]
-                if resource_candidates:
-                    return self._choose_policy_candidate(state, prompt_state, resource_candidates)
+                # Human-style resourcing: clickCard selections + Done/Skip
+                # buttons in one candidate set for the policy to choose from.
+                return self._choose_policy_candidate(state, prompt_state, candidates)
 
             if prompt_type == "displayCards":
                 done_candidates = [
@@ -857,21 +857,54 @@ class QueueBotClient:
             return self._annotate_candidates(state, prompt_state, candidates)
 
         if prompt_state.get("promptType") == "resource":
-            resource_candidates = self._build_resource_candidates(prompt_state, selectable_cards)
-            if resource_candidates:
-                candidates.extend(resource_candidates)
-
-            for button in buttons:
-                if str(button.get("arg", "")).strip().lower() == "done" or str(button.get("text", "")).strip().lower() == "done":
+            # Human-style resourcing: one clickCard per hand card (already-
+            # selected cards are excluded — no unselecting), plus the prompt
+            # buttons (Done / Skip Resourcing) in the same candidate set.
+            # Once the Done/Confirm button is enabled the quota is met and a
+            # human would just confirm — offer no more card clicks. Note that
+            # "Skip Resourcing" also carries arg 'done' — exclude it.
+            done_enabled = any(
+                not button.get("disabled")
+                and str(button.get("arg", "")).strip().lower() == "done"
+                and "skip" not in str(button.get("text", "")).strip().lower()
+                for button in (prompt_state.get("buttons") or [])
+            )
+            selected_uuids = {
+                str(card.get("uuid"))
+                for card in (prompt_state.get("selectedCards") or [])
+                if isinstance(card, dict) and card.get("uuid")
+            }
+            if not done_enabled:
+                for card in selectable_cards:
+                    if not card.get("uuid") or str(card["uuid"]) in selected_uuids:
+                        continue
+                    db_card = _card_db_by_id().get(str(card.get("id"))) or {}
                     candidates.append({
-                        "kind": "clickPrompt",
-                        "actionType": "clickPrompt",
-                        "arg": button.get("arg", "done"),
-                        "uuid": prompt_uuid,
-                        "method": button.get("command") or "menuButton",
-                        "description": "done",
+                        "kind": "cardClicked",
+                        "actionType": "clickCard",
+                        "cardUuid": card.get("uuid"),
+                        "description": card.get("name") or card.get("internalName") or card.get("uuid", "card"),
+                        "cost": float(db_card.get("cost") or 0.0),
+                        "features": {
+                            "is_card": 1.0,
+                            "is_friendly": 1.0,
+                            "is_leader": 0.0,
+                            "is_base": 0.0,
+                            "is_unit": 1.0 if (card.get("power") or card.get("printedPower")) else 0.0,
+                            "is_exhausted": 0.0,
+                            "card_power": float(card.get("power") or card.get("printedPower") or 0.0) / 10.0,
+                            "card_hp": float(card.get("hp") or card.get("remainingHp") or card.get("currentHp") or 0.0) / 20.0,
+                        },
                     })
-
+            for button in buttons:
+                candidates.append({
+                    "kind": button.get("command") or "menuButton",
+                    "actionType": "clickPrompt",
+                    "arg": button.get("arg", ""),
+                    "uuid": prompt_uuid,
+                    "method": button.get("command") or "menuButton",
+                    "description": button.get("text", "button"),
+                })
             return self._annotate_candidates(state, prompt_state, candidates)
 
         if prompt_state.get("promptType") == "distributeAmongTargets" and prompt_state.get("distributeAmongTargets"):
@@ -1495,7 +1528,7 @@ class QueueBotClient:
         if action_type == "macro_resource_cards":
             for card_uuid in action.get("uuids", []):
                 self.socket.emit("game", ("cardClicked", card_uuid))
-                time.sleep(0.05)
+                # time.sleep(0.05)
 
             done_button = self._find_done_button_for_current_prompt()
             if done_button is not None:
@@ -1609,7 +1642,7 @@ def main():
                 env.refresh()
             except Exception as exc:
                 if not args.reset:
-                    time.sleep(args.poll_delay)
+                    # time.sleep(args.poll_delay)
                     continue
                 raise RuntimeError(f"Unable to refresh server state: {exc}") from exc
 
@@ -1622,7 +1655,7 @@ def main():
             ]
 
             if len(my_action_indices) == 0:
-                time.sleep(args.poll_delay)
+                # time.sleep(args.poll_delay)
                 continue
 
             if policy is not None:
@@ -1647,7 +1680,7 @@ def main():
             if terminated or truncated:
                 break
 
-            time.sleep(0.05)
+            # time.sleep(0.05)
     except KeyboardInterrupt:
         print("Interrupted by user")
 

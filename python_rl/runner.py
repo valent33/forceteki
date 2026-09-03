@@ -296,7 +296,7 @@ class SingleAgentEpisodeRunner:
                     terminated = True
                     break
 
-                time.sleep(0.05)
+                # time.sleep(0.05)
                 continue
 
             no_action_polls = 0
@@ -355,7 +355,7 @@ class SingleAgentEpisodeRunner:
                 if truncated:
                     terminated = True
 
-                time.sleep(0.05)
+                # time.sleep(0.05)
                 continue
             self.steps += 1
             self.logger.record_rl_transition({
@@ -381,7 +381,7 @@ class SingleAgentEpisodeRunner:
             if truncated:
                 terminated = True
 
-            time.sleep(0.05)
+            # time.sleep(0.05)
 
 
 class TwoAgentEpisodeRunner:
@@ -505,7 +505,7 @@ class TwoAgentEpisodeRunner:
                     self.terminated = True
                 self.condition.notify_all()
 
-            time.sleep(0.05)
+            # time.sleep(0.05)
 
     def run(self, reset_options: dict[str, Any]) -> None:
         try:

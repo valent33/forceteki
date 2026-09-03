@@ -135,11 +135,15 @@ class SWUEnv(gym.Env):
     """
     metadata = {"render_modes": ["console"]}
 
-    def __init__(self, server_url="http://localhost:3005", player_id="111", single_agent_mode=False):
+    def __init__(self, server_url="http://localhost:3005", player_id="111", single_agent_mode=False, human_mode=False):
         super().__init__()
         self.server_url = server_url
         self.player_id = player_id
         self.single_agent_mode = single_agent_mode
+        # human_mode: a human controls exactly ONE seat — actions are only ever
+        # built for that seat, and "waiting for opponent" never redirects to
+        # the other player's prompt.
+        self.human_mode = human_mode
         
         # Define maximum possible categorical actions
         # Actions in SWU arise from dynamically showing buttons + clicking cards.
@@ -661,6 +665,9 @@ class SWUEnv(gym.Env):
                         focus_key = candidate_key
                         break
 
+        if self.human_mode:
+            focus_key = _controlled_prompt_key()
+
         if focus_key is None:
             focus_key = _controlled_prompt_key()
 
@@ -675,7 +682,8 @@ class SWUEnv(gym.Env):
 
         # If the focused player is just waiting, see if the OTHER player has an
         # actionable prompt (e.g. opponent needs to choose a number mid‑turn).
-        if player_prompt and "waiting for opponent" in menu_title.lower():
+        # In human_mode each terminal owns exactly one seat, so never redirect.
+        if player_prompt and "waiting for opponent" in menu_title.lower() and not self.human_mode:
             other_key = "player2" if p_key == "player1" else "player1"
             other_prompt = self.current_state["prompts"].get(other_key)
             if other_prompt and "waiting for opponent" not in str(other_prompt.get("menuTitle", "")).lower():
@@ -801,81 +809,74 @@ class SWUEnv(gym.Env):
                         "features": features,
                     })
 
-            # Workaround for Node.js `ResourcePrompt.ts` clearing `selectableCards`
-            # on the first tick before serialization.
+            # Resource prompts: plain clickCard actions, one card per click
+            # exactly like a human plays them. The server re-lists already-
+            # selected cards as selectable so the UI can un-select them — we
+            # exclude those: a selection is committed, no unselecting. When
+            # the quota is met the server lists ONLY the selected cards, so
+            # this yields zero card actions and the Done button is the only
+            # remaining action — the regular button loop adds it above.
+            # (Obs hand block 3 carries each card's cost, and the Q-head
+            # action features carry it too via the central attach loop.)
             if "to resource" in menu_title and self.current_state.get("state") and p_key in self.current_state["state"]:
                 my_state = self.current_state["state"][p_key]
-                import itertools
-
-                # Resourceing can only use the controlled player's hand.
-                #   Setup:   "Select 2 cards to resource"           → every pair.
-                #   Regroup: "Select between 0 and N cards to resource" → single
-                #            cards (0 = the "Skip Resourcing" button, which the
-                #            regular button loop above adds when enabled).
-                hand_cards = [c for c in my_state.get("hand", []) if c.get("uuid")]
-                if "between" in menu_title:
-                    card_groups = [(card,) for card in hand_cards]
-                elif "2 cards" in menu_title:
-                    card_groups = list(itertools.combinations(hand_cards, 2))
+                hand_by_uuid = {str(c.get("uuid")): c for c in my_state.get("hand", []) if c.get("uuid")}
+                selected_uuids = {str(uuid) for uuid in (player_prompt.get("selectedCards") or []) if uuid}
+                # Quota met: the Done/Confirm button is enabled (arg 'done').
+                # NOTE: "Skip Resourcing" also carries arg 'done' — exclude it.
+                # In the confirm state the server still lists cards (for
+                # unselecting), but a human would just confirm — offer no card
+                # clicks.
+                buttons_now = player_prompt.get("buttons") or []
+                done_enabled = any(
+                    not b.get("disabled")
+                    and str(b.get("arg", "")).strip().lower() == "done"
+                    and "skip" not in str(b.get("text", "")).strip().lower()
+                    for b in buttons_now
+                )
+                server_selectable = [str(uuid) for uuid in (player_prompt.get("selectableCards") or []) if uuid]
+                if done_enabled:
+                    candidate_cards = []
+                elif server_selectable:
+                    candidate_cards = [hand_by_uuid[u] for u in server_selectable if u in hand_by_uuid]
+                    if not candidate_cards:
+                        # Stale selectableCards from the previous prompt (e.g.
+                        # action-phase hand cards on the first regroup tick) —
+                        # fall back to the full hand.
+                        candidate_cards = list(hand_by_uuid.values())
                 else:
-                    card_groups = [(card,) for card in hand_cards]
-
-                for group in card_groups:
-                    if len(group) == 1:
-                        card = group[0]
-                        power_val = float(card.get("power") or card.get("printedPower") or 0.0)
-                        hp_val = float(card.get("hp") or card.get("remainingHp") or card.get("currentHp") or 0.0)
-                        features = {
-                            "is_stateful": 0.0,
-                            "is_macro": 1.0,
-                            "is_dropdown": 0.0,
-                            "is_done": 0.0,
-                            "is_claim": 0.0,
-                            "is_pass": 0.0,
-                            "is_card": 1.0,
-                            "is_friendly": 1.0,
-                            "is_leader": 0.0,
-                            "is_base": 0.0,
-                            "is_exhausted": 0.0,
-                            "is_unit": 0.0,
-                            "card_power": power_val / 10.0,
-                            "card_hp": hp_val / 20.0,
-                        }
-                        self.available_actions.append({
-                            "playerId": p_id,
-                            "actionType": "macro_resource_cards",
-                            "uuids": [card["uuid"]],
-                            "arg": "any",
-                            "internalName": card.get("internalName", "Unknown"),
-                            "cost": float(self._card_data(card.get("internalName")).get("cost") or 0.0),
-                            "features": features,
-                        })
-                    else:
-                        features = {
-                            "is_stateful": 0.0,
-                            "is_macro": 1.0,
-                            "is_dropdown": 0.0,
-                            "is_done": 0.0,
-                            "is_claim": 0.0,
-                            "is_pass": 0.0,
-                            "is_card": 1.0,
-                            "is_friendly": 1.0,
-                            "is_leader": 0.0,
-                            "is_base": 0.0,
-                            "is_exhausted": 0.0,
-                            "is_unit": 0.0,
-                            "card_power": 0.0,
-                            "card_hp": 0.0,
-                        }
-                        self.available_actions.append({
-                            "playerId": p_id,
-                            "actionType": "macro_resource_cards",
-                            "uuids": [group[0]["uuid"], group[1]["uuid"]],
-                            "arg": "any",
-                            "internalName": f"{group[0].get('internalName', 'Unknown')} + {group[1].get('internalName', 'Unknown')}",
-                            "cost": sum(float(self._card_data(card.get("internalName")).get("cost") or 0.0) for card in group),
-                            "features": features,
-                        })
+                    # The server clears selectableCards on the first serialization
+                    # tick — fall back to the full hand.
+                    candidate_cards = list(hand_by_uuid.values())
+                for card in candidate_cards:
+                    if str(card.get("uuid")) in selected_uuids:
+                        continue
+                    power_val = float(card.get("power") or card.get("printedPower") or 0.0)
+                    hp_val = float(card.get("hp") or card.get("remainingHp") or card.get("currentHp") or 0.0)
+                    features = {
+                        "is_stateful": 0.0,
+                        "is_macro": 0.0,
+                        "is_dropdown": 0.0,
+                        "is_done": 0.0,
+                        "is_claim": 0.0,
+                        "is_pass": 0.0,
+                        "is_card": 1.0,
+                        "is_friendly": 1.0,
+                        "is_leader": 0.0,
+                        "is_base": 0.0,
+                        "is_exhausted": 0.0,
+                        "is_unit": 1.0 if (card.get("power") is not None or card.get("printedPower") is not None) else 0.0,
+                        "card_power": power_val / 10.0,
+                        "card_hp": hp_val / 20.0,
+                    }
+                    self.available_actions.append({
+                        "playerId": p_id,
+                        "actionType": "clickCard",
+                        "uuid": card["uuid"],
+                        "arg": "any",
+                        "internalName": card.get("internalName", "Unknown"),
+                        "features": features,
+                    })
             elif (len(selectable_uuids) > 0 or len(display_cards) > 0) and self.current_state.get("state") and p_key in self.current_state["state"] and not is_stateful_distribution_prompt:
                 my_state = self.current_state["state"][p_key]
 
