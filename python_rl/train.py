@@ -548,7 +548,7 @@ def play_one_game(env, p1_policy, p2_policy, reset_payload: dict, max_steps: int
                 env.refresh()
             except Exception:
                 return None
-            time.sleep(0.01)
+            # time.sleep(0.01)
             continue
         last_signature = signature
         stall_count = 0
@@ -562,7 +562,7 @@ def play_one_game(env, p1_policy, p2_policy, reset_payload: dict, max_steps: int
                 env.refresh()
             except Exception:
                 return None
-            time.sleep(0.01)
+            # time.sleep(0.01)
             continue
 
         try:
@@ -1566,12 +1566,12 @@ def main():
                         episode_metrics["final_phase"] = phase
                         terminated = True
                         break
-                    time.sleep(0.01)
+                    # time.sleep(0.01)
                     continue
 
                 if action >= len(available_actions) or action < 0:
                     logger.log(f"Policy produced invalid action {action} for {len(available_actions)} available", player_id=args.player_id)
-                    time.sleep(0.01)
+                    # time.sleep(0.01)
                     continue
 
                 chosen_action = available_actions[action]
@@ -1682,7 +1682,7 @@ def main():
                         episode_metrics["final_phase"] = phase
                         terminated = True
                         break
-                    time.sleep(0.01)
+                    # time.sleep(0.01)
                     continue
 
                 opponent_action = list(env.available_actions)[action] if 0 <= action < len(env.available_actions) else None

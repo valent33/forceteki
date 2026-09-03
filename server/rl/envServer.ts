@@ -215,7 +215,10 @@ function getState() {
             id: p.id,
             name: p.name,
             base: serializeCard(p.base),
-            leader: serializeCard(p.leader),
+            // The leader lives in `deckLeader` (Player has no plain `leader`
+            // property) — without this the leader serialized as null and was
+            // never offered as a clickable action (deploy / leader abilities).
+            leader: serializeCard(p.leader || p.deckLeader),
             hand: hand.map(serializeCard),
             deck: deck.map(serializeCard),
             discard: discard.map(serializeCard),
