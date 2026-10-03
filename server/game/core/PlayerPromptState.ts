@@ -135,6 +135,7 @@ export class PlayerPromptState {
         return {
             selectCardMode: this.selectCardMode,
             selectOrder: this.selectOrder,
+            selectedCards: this._selectedCards.map((card) => ({ uuid: card.uuid, id: card.internalName })),
             selectNumber: this.selectNumber,
             distributeAmongTargets: this.distributeAmongTargets,
             batchTriggerResolution: this.batchTriggerResolution,

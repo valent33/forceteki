@@ -1814,7 +1814,35 @@ export class Game extends EventEmitter {
                     format: this.format,
                     winners: this.winnerNames,
                     undoEnabled: this.isUndoEnabled,
-                    ongoingEffects,
+                    // Whose prompt the engine is ACTUALLY waiting on. The
+                    // pipeline routes every click to its current step, so a
+                    // click sent while someone else's prompt is on top is
+                    // silently dropped. Clients use this to hold clicks until
+                    // it is really their turn. Action phase: the action-phase
+                    // active player. Other phases: the player whose prompt
+                    // matches the current pipeline step's uuid.
+                    activePromptPlayerId: (() => {
+                        if (this.currentPhase === PhaseName.Action && this.actionPhaseActivePlayer) {
+                            return this.actionPhaseActivePlayer.id;
+                        }
+                        const currentStep = this.pipeline.currentStep as any;
+                        const stepUuid = currentStep?.uuid;
+                        if (!stepUuid) {
+                            return null;
+                        }
+                        // Shared prompts (AllPlayerPrompt — e.g. resourcing, where
+                        // BOTH seats pick their card at the same time) match every
+                        // player's promptUuid. Reporting a single id there would
+                        // make the other seat wait forever for "its turn". Only
+                        // report an owner when exactly one player's prompt matches.
+                        const matchedPlayerIds: string[] = [];
+                        for (const player of this.getPlayers()) {
+                            if (player.promptState.promptUuid === stepUuid) {
+                                matchedPlayerIds.push(player.id);
+                            }
+                        }
+                        return matchedPlayerIds.length === 1 ? matchedPlayerIds[0] : null;
+                    })(),
                 };
 
                 // Advance the offset for this participant
