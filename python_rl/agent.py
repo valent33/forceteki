@@ -670,6 +670,14 @@ class QueueBotClient:
             if not prompt_uuid:
                 return
 
+            # The pipeline routes every click to its CURRENT step: acting while
+            # someone else's prompt is on top silently drops the click (this is
+            # what makes the bot "skip resourcing" in GUI games). Wait for the
+            # server to report that it is really our turn.
+            owner = state.get("activePromptPlayerId")
+            if owner is not None and str(owner) != str(self.player_id):
+                return
+
             state_signature = json.dumps(player_state, sort_keys=True, default=str)
             if state_signature == self.last_state_signature:
                 return
@@ -874,6 +882,14 @@ class QueueBotClient:
                 for card in (prompt_state.get("selectedCards") or [])
                 if isinstance(card, dict) and card.get("uuid")
             }
+            # The socket server does not always serialize promptState.selectedCards —
+            # the selection is marked on the cards themselves (`selected: true`), so
+            # merge those in. Without this, the already-resourced card stays in the
+            # menu and re-clicking it UNSELECTS it server-side (then Confirm finds
+            # nothing selected and resourcing is skipped).
+            for card in selectable_cards:
+                if card.get("selected"):
+                    selected_uuids.add(str(card.get("uuid")))
             if not done_enabled:
                 for card in selectable_cards:
                     if not card.get("uuid") or str(card["uuid"]) in selected_uuids:
