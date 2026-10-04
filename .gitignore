@@ -30,3 +30,4 @@ python_rl/runs/
 *.pyc
 python_rl/human_gui.jsonl
 python_rl/policy_bc.ckpt
+python_rl/.swudb_profile
