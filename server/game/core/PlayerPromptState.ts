@@ -136,6 +136,9 @@ export class PlayerPromptState {
             selectCardMode: this.selectCardMode,
             selectOrder: this.selectOrder,
             selectedCards: this._selectedCards.map((card) => ({ uuid: card.uuid, id: card.internalName })),
+            // Legal targets for the current prompt (e.g. a distribute-among-targets
+            // prompt) so scripted clients don't have to guess them from the board.
+            selectableCards: this._selectableCards.map((card) => card.uuid),
             selectNumber: this.selectNumber,
             distributeAmongTargets: this.distributeAmongTargets,
             batchTriggerResolution: this.batchTriggerResolution,

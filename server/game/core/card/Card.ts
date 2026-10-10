@@ -1428,6 +1428,28 @@ export class Card extends OngoingEffectSourceBase implements IGameStatisticsTrac
                 name: this.title,
                 power: this.cardData.power,
                 hp: this.cardData.hp,
+                printedHp: this.cardData.hp,
+                // Remaining HP (printed HP minus damage). Exposed so scripted
+                // clients can plan targeting/distributions without re-deriving it.
+                remainingHp: (() => {
+                    const card = this as unknown as { getHp?: () => number; damage?: number };
+                    try {
+                        const current = card.getHp?.();
+                        if (typeof current === 'number') {
+                            return current;
+                        }
+                    } catch (error) {
+                        // card type does not track HP
+                    }
+                    try {
+                        if (typeof card.damage === 'number' && typeof this.cardData.hp === 'number') {
+                            return this.cardData.hp - card.damage;
+                        }
+                    } catch (error) {
+                        // card type does not track damage
+                    }
+                    return undefined;
+                })(),
                 unimplemented: !this.isImplemented || undefined,    // don't bother sending "unimplemented: false" to the client
                 type: this.type,
                 uuid: this.uuid,

@@ -1814,34 +1814,43 @@ export class Game extends EventEmitter {
                     format: this.format,
                     winners: this.winnerNames,
                     undoEnabled: this.isUndoEnabled,
-                    // Whose prompt the engine is ACTUALLY waiting on. The
-                    // pipeline routes every click to its current step, so a
-                    // click sent while someone else's prompt is on top is
-                    // silently dropped. Clients use this to hold clicks until
-                    // it is really their turn. Action phase: the action-phase
-                    // active player. Other phases: the player whose prompt
-                    // matches the current pipeline step's uuid.
+                    // Whose prompt the engine is ACTUALLY waiting on. Clients
+                    // use this to hold clicks until it is really their turn
+                    // (clicks sent while someone else's prompt is on top are
+                    // dropped by the pipeline).
+                    //
+                    // We follow the DEEPEST step so nested prompts (a
+                    // "distribute among targets" opened while resolving an
+                    // ability, a trigger window during the opponent's turn, ...)
+                    // correctly report their owner instead of falling back to
+                    // "the action-phase player" and making clients wait forever.
                     activePromptPlayerId: (() => {
+                        const currentStep = this.pipeline.getDeepestCurrentStep() as any;
+                        const stepUuid = currentStep?.uuid;
+                        if (stepUuid) {
+                            const matchedPlayerIds: string[] = [];
+                            for (const player of this.getPlayers()) {
+                                if (player.promptState.promptUuid === stepUuid) {
+                                    matchedPlayerIds.push(player.id);
+                                }
+                            }
+                            if (matchedPlayerIds.length === 1) {
+                                return matchedPlayerIds[0];
+                            }
+                            if (matchedPlayerIds.length > 1) {
+                                // Shared prompt (AllPlayerPrompt, e.g. resourcing)
+                                // or an active prompt plus its "waiting for
+                                // opponent" counterpart: no single owner, so
+                                // nobody should hold.
+                                return undefined;
+                            }
+                        }
+                        // No prompt step: in the action phase the action window
+                        // belongs to the action-phase active player.
                         if (this.currentPhase === PhaseName.Action && this.actionPhaseActivePlayer) {
                             return this.actionPhaseActivePlayer.id;
                         }
-                        const currentStep = this.pipeline.currentStep as any;
-                        const stepUuid = currentStep?.uuid;
-                        if (!stepUuid) {
-                            return null;
-                        }
-                        // Shared prompts (AllPlayerPrompt — e.g. resourcing, where
-                        // BOTH seats pick their card at the same time) match every
-                        // player's promptUuid. Reporting a single id there would
-                        // make the other seat wait forever for "its turn". Only
-                        // report an owner when exactly one player's prompt matches.
-                        const matchedPlayerIds: string[] = [];
-                        for (const player of this.getPlayers()) {
-                            if (player.promptState.promptUuid === stepUuid) {
-                                matchedPlayerIds.push(player.id);
-                            }
-                        }
-                        return matchedPlayerIds.length === 1 ? matchedPlayerIds[0] : null;
+                        return undefined;
                     })(),
                 };
 

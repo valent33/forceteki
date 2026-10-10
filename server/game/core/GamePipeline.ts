@@ -22,6 +22,27 @@ export class GamePipeline {
         return this.pipeline[this.pipeline.length - 1];
     }
 
+    /**
+     * The innermost step currently being resolved: follows nested sub-pipelines
+     * (e.g. an ability resolver that opened a "distribute among targets"
+     * prompt). `currentStep` only returns the top of THIS pipeline, which is
+     * why prompt-ownership checks used to miss nested prompts.
+     */
+    public getDeepestCurrentStep(): IStep | null {
+        let step: IStep | null = (this.currentStep as IStep) ?? null;
+        const seen = new Set<IStep>();
+        while (step && !seen.has(step)) {
+            seen.add(step);
+            const nestedPipeline = (step as unknown as { pipeline?: GamePipeline }).pipeline;
+            const nested = nestedPipeline?.currentStep as IStep | undefined;
+            if (!nested) {
+                break;
+            }
+            step = nested;
+        }
+        return step;
+    }
+
     public initialise(steps: StepItem[]): void {
         this.addStepsToPipeline(steps);
     }

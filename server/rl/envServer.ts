@@ -186,6 +186,8 @@ function getState() {
             zone: card.zone?.name || 'unknown',
             power,
             hp,
+            remainingHp: hp,
+            printedHp: (hp != null && damage != null) ? hp + damage : hp,
             damage,
             exhausted,
             upgrades: upgradesArr
@@ -240,6 +242,11 @@ function getState() {
         activePlayer: gameFlowWrapper.game.initiativePlayer?.id,
         player1Id: gameFlowWrapper.player1Id,
         player2Id: gameFlowWrapper.player2Id,
+        // Authoritative game-over result (Game.winnerNames holds Player.name —
+        // 'player1'/'player2' — not the user ids). Without this, endings that
+        // aren't base destruction (deck-out, "has won" effects) could not be
+        // classified and every such game came back as "unresolved".
+        winners: gameFlowWrapper.game.winnerNames,
         prompts: {
             player1: {
                 ...gameFlowWrapper.player1.player.currentPrompt(),
