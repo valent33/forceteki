@@ -111,6 +111,8 @@ def main() -> int:
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--max_samples", type=int, default=0, help="Cap on samples (0 = all)")
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--val_split", type=float, default=0.15, help="Fraction held out to measure generalisation (0 = train on everything)")
+    parser.add_argument("--seed", type=int, default=0, help="Seed for the train/val split")
     args = parser.parse_args()
 
     env = SWUEnv(server_url="http://localhost:9", player_id="111", single_agent_mode=True)
@@ -130,33 +132,55 @@ def main() -> int:
         return 1
 
     indices = list(range(len(obs_list)))
+    if args.val_split and len(indices) > 10:
+        random.Random(args.seed).shuffle(indices)
+        val_size = max(1, int(len(indices) * args.val_split))
+        train_indices, val_indices = indices[val_size:], indices[:val_size]
+    else:
+        train_indices, val_indices = indices, []
+    print(f"BC split: {len(train_indices)} train / {len(val_indices)} val")
     obs_tensor = torch.tensor(np.stack(obs_list), dtype=torch.float32).to(args.device)
 
-    for epoch in range(1, args.epochs + 1):
-        random.shuffle(indices)
-        epoch_loss = 0.0
-        epoch_correct = 0
-        batches = 0
-        for start in range(0, len(indices), args.batch_size):
-            batch_idx = indices[start:start + args.batch_size]
+    def run_epoch(epoch_indices, train):
+        order = list(epoch_indices)
+        if train:
+            random.shuffle(order)
+        loss_sum, correct = 0.0, 0
+        for start in range(0, len(order), args.batch_size):
+            batch_idx = order[start:start + args.batch_size]
             batch_obs = obs_tensor[batch_idx]
             batch_feats = [torch.tensor(feat_list[i], dtype=torch.float32).to(args.device) for i in batch_idx]
             batch_masks = [mask_list[i] for i in batch_idx]
             batch_targets = torch.tensor([target_list[i] for i in batch_idx], dtype=torch.long).to(args.device)
+            with torch.set_grad_enabled(train):
+                q_logits, _ = policy.evaluate_q(batch_obs, batch_feats, batch_masks)
+                loss = F.cross_entropy(q_logits, batch_targets)
+            if train:
+                policy.optimizer.zero_grad()
+                loss.backward()
+                policy.optimizer.step()
+            loss_sum += float(loss.item()) * len(batch_idx)
+            correct += int((q_logits.argmax(dim=1) == batch_targets).sum().item())
+        n = max(1, len(order))
+        return loss_sum / n, correct / n
 
-            q_logits, _ = policy.evaluate_q(batch_obs, batch_feats, batch_masks)
-            loss = F.cross_entropy(q_logits, batch_targets)
-            policy.optimizer.zero_grad()
-            loss.backward()
-            policy.optimizer.step()
+    best_state, best_val_acc, best_epoch, acc = None, -1.0, 0, 0.0
+    for epoch in range(1, args.epochs + 1):
+        train_loss, train_acc = run_epoch(train_indices, True)
+        acc = train_acc
+        if val_indices:
+            val_loss, val_acc = run_epoch(val_indices, False)
+            if val_acc >= best_val_acc:
+                best_val_acc, best_epoch = val_acc, epoch
+                best_state = {k: v.detach().cpu().clone() for k, v in policy.net.state_dict().items()}
+            print(f"epoch {epoch}/{args.epochs}: train loss={train_loss:.4f} acc={train_acc:.1%} | "
+                  f"val loss={val_loss:.4f} acc={val_acc:.1%}")
+        else:
+            print(f"epoch {epoch}/{args.epochs}: loss={train_loss:.4f} accuracy={train_acc:.1%}")
 
-            epoch_loss += float(loss.item()) * len(batch_idx)
-            epoch_correct += int((q_logits.argmax(dim=1) == batch_targets).sum().item())
-            batches += 1
-
-        epoch_loss /= max(1, len(indices))
-        acc = epoch_correct / max(1, len(indices))
-        print(f"epoch {epoch}/{args.epochs}: loss={epoch_loss:.4f} accuracy={acc:.1%}")
+    if best_state is not None:
+        policy.net.load_state_dict(best_state)
+        print(f"Keeping best epoch {best_epoch} (val accuracy {best_val_acc:.1%}) — that is your epoch count.")
 
     payload = {
         "model_state_dict": {key: value.detach().cpu() for key, value in policy.net.state_dict().items()},
@@ -165,10 +189,13 @@ def main() -> int:
         "obs_size": policy.obs_size,
         "max_actions": policy.max_actions,
         "checkpoint_source": args.checkpoint,
-        "bc_meta": {"samples": matched, "skipped": skipped, "epochs": args.epochs, "lr": args.lr},
+        "bc_meta": {"samples": matched, "skipped": skipped, "epochs": args.epochs, "lr": args.lr,
+                    "val_split": args.val_split, "val_samples": len(val_indices),
+                    "best_epoch": best_epoch or None,
+                    "best_val_accuracy": best_val_acc if best_val_acc >= 0 else None},
     }
     torch.save(payload, args.out)
-    print(f"Saved BC checkpoint to {args.out} (final accuracy {acc:.1%})")
+    print(f"Saved BC checkpoint to {args.out} (train accuracy {acc:.1%})")
     return 0
 
 
