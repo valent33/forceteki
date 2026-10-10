@@ -31,3 +31,6 @@ python_rl/runs/
 python_rl/human_gui.jsonl
 python_rl/policy_bc.ckpt
 python_rl/.swudb_profile
+
+# Git worktree checkouts
+.worktrees/
