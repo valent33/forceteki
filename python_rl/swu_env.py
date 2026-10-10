@@ -14,6 +14,7 @@ import sys as _sys
 from gymnasium import spaces
 
 from torch_policy import build_action_features
+from distribution import allocate_distribution
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Star Wars: Unlimited domain dictionaries (Forceteki card data)
@@ -2155,41 +2156,45 @@ class SWUEnv(gym.Env):
             except Exception:
                 return False
 
-        def _collect_cards_by_uuid() -> dict[str, dict[str, Any]]:
+        def _collect_cards_by_uuid() -> tuple[dict[str, dict[str, Any]], set[str]]:
             cards: dict[str, dict[str, Any]] = {}
+            friendly_uuids: set[str] = set()
 
-            def _add_card(card: dict[str, Any] | None) -> None:
+            def _add_card(card: dict[str, Any] | None, friendly: bool) -> None:
                 if not isinstance(card, dict):
                     return
                 uuid = card.get("uuid")
-                if uuid:
-                    cards[str(uuid)] = card
+                if not uuid:
+                    return
+                cards[str(uuid)] = card
+                if friendly:
+                    friendly_uuids.add(str(uuid))
 
             for zone in ("hand", "spaceArena", "groundArena"):
                 for card in player_state.get(zone, []):
-                    _add_card(card)
+                    _add_card(card, True)
                     for upgrade in card.get("upgrades", []):
-                        _add_card(upgrade)
+                        _add_card(upgrade, True)
             for key in ("leader", "base"):
-                _add_card(player_state.get(key))
+                _add_card(player_state.get(key), True)
                 for upgrade in (player_state.get(key) or {}).get("upgrades", []):
-                    _add_card(upgrade)
+                    _add_card(upgrade, True)
 
             opp_key = "player2" if prompt_key == "player1" else "player1"
             opp_state = state_section.get(opp_key) or {}
             for zone in ("spaceArena", "groundArena"):
                 for card in opp_state.get(zone, []):
-                    _add_card(card)
+                    _add_card(card, False)
                     for upgrade in card.get("upgrades", []):
-                        _add_card(upgrade)
+                        _add_card(upgrade, False)
             for key in ("leader", "base"):
-                _add_card(opp_state.get(key))
+                _add_card(opp_state.get(key), False)
                 for upgrade in (opp_state.get(key) or {}).get("upgrades", []):
-                    _add_card(upgrade)
+                    _add_card(upgrade, False)
 
-            return cards
+            return cards, friendly_uuids
 
-        cards_by_uuid = _collect_cards_by_uuid()
+        cards_by_uuid, friendly_uuids = _collect_cards_by_uuid()
 
         def _resolve_prompt_card(card_ref: dict[str, Any]) -> dict[str, Any] | None:
             uuid = card_ref.get("uuid") or card_ref.get("cardUuid")
@@ -2227,47 +2232,16 @@ class SWUEnv(gym.Env):
                 return {"type": distribution_type, "valueDistribution": []}
             return None
 
-        value_distribution = []
-
-        remaining = int(amount)
-        max_targets = distribute_prompt.get("maxTargets")
-        # Absorb the damage on the highest-remaining-HP targets first (typically
-        # a base at 25-30 HP): concentrating damage minimizes unit losses.
-        candidate_cards.sort(key=lambda card: _remaining_hp(card), reverse=True)
-
-        is_indirect_damage = distribution_type == "distributeIndirectDamage"
-
-        for card in candidate_cards:
-            if remaining <= 0:
-                break
-            if max_targets is not None and len(value_distribution) >= int(max_targets):
-                break
-
-            cap = remaining
-            if is_indirect_damage and _is_unit(card):
-                cap = min(cap, int(_remaining_hp(card)))
-
-            if cap <= 0:
-                continue
-
-            value_distribution.append({"uuid": card.get("uuid") or card.get("cardUuid"), "amount": cap})
-            remaining -= cap
-
-        if remaining > 0 and not distribute_prompt.get("canDistributeLess"):
-            # We could not find a full legal allocation under the target cap constraints.
-            # Leave the results empty so the caller can retry with a different prompt state.
+        # Type-aware, validated allocation (shared with agent.py /
+        # human_socket_play.py): tokens spread across friendly units, damage
+        # focuses / obeys remaining-HP caps, healing tops up the most damaged.
+        allocation = allocate_distribution(
+            distribute_prompt,
+            [(card, str(card.get("uuid")) in friendly_uuids) for card in candidate_cards],
+        )
+        if allocation is None:
             return None
-
-        if not value_distribution and not distribute_prompt.get("canChooseNoTargets"):
-            return None
-
-        if is_indirect_damage:
-            for entry in value_distribution:
-                card = cards_by_uuid.get(str(entry.get("uuid")))
-                if card and _is_unit(card) and int(entry.get("amount") or 0) > int(_remaining_hp(card)):
-                    return None
-
-        return {"type": distribution_type, "valueDistribution": value_distribution}
+        return {"type": distribution_type, "valueDistribution": allocation}
 
     def _state_player_key(self, state: dict[str, Any] | None) -> str | None:
         if not state:
@@ -2464,10 +2438,19 @@ class SWUEnv(gym.Env):
         winners = current_state.get("winners", []) if current_state else []
         phase = current_state.get("phase") if current_state else None
 
-        # Terminal reward: use base HP to determine winner (winners list is unreliable).
-        # Recompute current player keys from current_state to avoid scoping issues.
+        # Terminal reward. Prefer the server's winner list when present: it is
+        # authoritative for endings that are not base destruction (deck-out,
+        # "has won" effects) — and `winnerNames` holds Player.name
+        # ('player1'/'player2'), NOT the player ids, which is why the old
+        # id-vs-name comparison always produced -5.
+        # Base HP stays as the fallback for environments that don't report it.
         term_key = self._state_player_key(current_state)
-        if term_key:
+        if winners:
+            my_seat = term_key or (
+                "player1" if str((current_state or {}).get("player1Id")) == str(self.player_id) else "player2"
+            )
+            reward += 10.0 if my_seat in {str(w) for w in winners} else -10.0
+        elif term_key:
             term_player = self._safe_state_player(current_state, term_key)
             term_opp_key = "player2" if term_key == "player1" else "player1"
             term_opp = self._safe_state_player(current_state, term_opp_key)
@@ -2481,10 +2464,8 @@ class SWUEnv(gym.Env):
                 reward += win_r
             elif my_base <= 0 and opp_base <= 0:
                 win_r = 0.0    # simultaneous destruction — draw
-        elif len(winners) > 0 or phase == "game_end":
-            # Fallback if player-key lookup fails but winners list populated
-            win_r = 5.0 if str(self.player_id) in {str(w) for w in winners} else -5.0
-            reward += win_r
+        # else: game over with no reported winner and both bases alive — no
+        # terminal signal, rather than teaching a wrong sign.
 
         # Debug: print reward breakdown every 50th call
         # if not hasattr(self, "_reward_debug_count"):

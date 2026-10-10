@@ -738,11 +738,14 @@ def _section_base_hp(section: dict | None, key: str) -> float:
 
 
 def _run_worker_episode(env, policy, opponent_policy, player_id, reset_payload, max_steps,
-                        p1_key=None, p2_key=None):
+                        p1_key=None, p2_key=None, opponent_source="champion"):
     """Run one full episode.
 
     Returns (obs_list, actions, feature_list, mask_list, rewards, steps,
-    winner, agent_hp, opp_hp, p1_key, p2_key) for the AGENT's steps only.
+    winner, agent_hp, opp_hp, p1_key, p2_key, metrics) for the AGENT's steps
+    only. `metrics` mirrors the serial loop's per-episode summary so the
+    parallel path can write the same episode_summaries.csv schema (dashboards
+    read `opponent_rewards`, `agent_turns`, `end_by`, ... from it).
     Log-probs and values are recomputed by the main process under the current
     policy (async-A2C correction), which also avoids pickling grad-enabled
     tensors. `p1_key` is the agent's deck key, `p2_key` the opponent's."""
@@ -751,6 +754,46 @@ def _run_worker_episode(env, policy, opponent_policy, player_id, reset_payload, 
     feature_list: list = []
     mask_list: list = []
     rewards: list = []
+    metrics: dict = {
+        "agent_turns": 0,
+        "opponent_turns": 0,
+        "agent_rewards": 0.0,
+        "opponent_rewards": 0.0,
+        "total_rewards": 0.0,
+        "total_reward_steps": 0,
+        "valid_actions_sum": 0,
+        "valid_actions_count": 0,
+        "agent_valid_actions_sum": 0,
+        "agent_valid_actions_count": 0,
+        "agent_max_valid_actions": 0,
+        "agent_base_hp_sum": 0.0,
+        "agent_leader_hp_sum": 0.0,
+        "agent_board_power_sum": 0.0,
+        "agent_board_hp_sum": 0.0,
+        "agent_board_damage_sum": 0.0,
+        "agent_unit_count_sum": 0.0,
+        "agent_exhausted_sum": 0.0,
+        "agent_ready_resources_sum": 0.0,
+        "agent_credits_sum": 0.0,
+        "agent_hand_sum": 0.0,
+        "opp_base_hp_sum": 0.0,
+        "opp_leader_hp_sum": 0.0,
+        "opp_board_power_sum": 0.0,
+        "opp_board_hp_sum": 0.0,
+        "opp_board_damage_sum": 0.0,
+        "opp_unit_count_sum": 0.0,
+        "opp_exhausted_sum": 0.0,
+        "opp_hand_sum": 0.0,
+        "cards_played": 0,
+        "agent_cards_played": 0,
+        "cancel_clicks": 0,
+        "pass_clicks": 0,
+        "done_clicks": 0,
+        "attack_clicks": 0,
+        "final_phase": None,
+        "ended_by": "max_steps",
+        "opponent_source": opponent_source,
+    }
     try:
         _, info = env.reset(options=reset_payload)
     except Exception:
@@ -764,10 +807,38 @@ def _run_worker_episode(env, policy, opponent_policy, player_id, reset_payload, 
             actor, collect = policy, True
         else:
             actor, collect = opponent_policy, False
+
+        # Per-episode accounting (mirrors the serial training loop so the
+        # parallel path can write the same episode_summaries.csv schema).
+        state_now = env.current_state or {}
+        seat_key = _player_key_for_id(state_now, player_id) or "player1"
+        opp_seat_key = "player2" if seat_key == "player1" else "player1"
+        valid_now = len(env.available_actions)
+        metrics["valid_actions_sum"] += valid_now
+        metrics["valid_actions_count"] += 1
+        metrics["agent_max_valid_actions"] = max(metrics["agent_max_valid_actions"], valid_now)
+        board_agent = _unit_board_metrics(state_now.get("state") or {}, seat_key)
+        board_opp = _unit_board_metrics(state_now.get("state") or {}, opp_seat_key)
+        if collect:
+            metrics["agent_valid_actions_sum"] += valid_now
+            metrics["agent_valid_actions_count"] += 1
+        for prefix, board in (("agent_", board_agent), ("opp_", board_opp)):
+            metrics[f"{prefix}base_hp_sum"] += board["base_hp"]
+            metrics[f"{prefix}leader_hp_sum"] += board["leader_hp"]
+            metrics[f"{prefix}board_power_sum"] += board["board_power"]
+            metrics[f"{prefix}board_hp_sum"] += board["board_hp"]
+            metrics[f"{prefix}board_damage_sum"] += board["board_damage"]
+            metrics[f"{prefix}unit_count_sum"] += board["unit_count"]
+            metrics[f"{prefix}exhausted_sum"] += board["exhausted_count"]
+            metrics[f"{prefix}hand_sum"] += board["hand_count"]
+        metrics["agent_ready_resources_sum"] += board_agent["ready_resources"]
+        metrics["agent_credits_sum"] += board_agent["credits"]
+
         if not env.available_actions:
             try:
                 env.refresh()
             except Exception:
+                metrics["ended_by"] = "refresh_failed"
                 break
             continue
         obs_vec = torch.tensor(env._get_obs(), dtype=torch.float32)
@@ -791,7 +862,29 @@ def _run_worker_episode(env, policy, opponent_policy, player_id, reset_payload, 
         try:
             _, reward, terminated, truncated, info = env.step(action)
         except Exception:
+            metrics["ended_by"] = "step_error"
             break
+
+        chosen = step_candidates[action] if 0 <= action < len(step_candidates) else None
+        acting_seat = seat_key if collect else opp_seat_key
+        prompt_now = (state_now.get("prompts") or {}).get(acting_seat) or {}
+        _bump_action_metrics(metrics, chosen, prompt_now.get("menuTitle", ""))
+        if chosen and str(chosen.get("actionType") or "") == "clickCard":
+            hand = ((state_now.get("state") or {}).get(acting_seat) or {}).get("hand") or []
+            card_uuid = chosen.get("uuid", "")
+            if any(card.get("uuid") == card_uuid for card in hand):
+                metrics["cards_played"] += 1
+                if collect:
+                    metrics["agent_cards_played"] += 1
+        metrics["total_rewards"] += float(reward)
+        metrics["total_reward_steps"] += 1
+        if collect:
+            metrics["agent_turns"] += 1
+            metrics["agent_rewards"] += float(reward)
+        else:
+            metrics["opponent_turns"] += 1
+            metrics["opponent_rewards"] += -float(reward)
+
         if collect and logp is not None:
             obs_list.append(obs_vec.numpy().astype(np.float32))
             actions.append(int(action))
@@ -802,6 +895,7 @@ def _run_worker_episode(env, policy, opponent_policy, player_id, reset_payload, 
             mask_list.append(step_mask)
             rewards.append(float(reward))
         if truncated:
+            metrics["ended_by"] = "truncated"
             break
 
     state = env.current_state or {}
@@ -811,7 +905,15 @@ def _run_worker_episode(env, policy, opponent_policy, player_id, reset_payload, 
 
     agent_hp = _section_base_hp(section, agent_key)
     opp_hp = _section_base_hp(section, opp_key)
-    if agent_hp <= 0 and opp_hp > 0:
+
+    # Prefer the server's winner list: `winners` holds Player.name
+    # ('player1'/'player2') so compare it against the SEAT key, not the user id.
+    # Endings that are not base destruction (deck-out, "has won" effects) can't
+    # be classified from HP at all — those were the "unresolved" games.
+    winners = [str(name) for name in (state.get("winners") or [])]
+    if winners:
+        winner = "agent" if agent_key in winners else "opponent"
+    elif agent_hp <= 0 and opp_hp > 0:
         winner = "opponent"
     elif opp_hp <= 0 and agent_hp > 0:
         winner = "agent"
@@ -819,7 +921,18 @@ def _run_worker_episode(env, policy, opponent_policy, player_id, reset_payload, 
         winner = "draw"
     else:
         winner = "unresolved"
-    return obs_list, actions, feature_list, mask_list, rewards, step, winner, agent_hp, opp_hp, p1_key, p2_key
+
+    metrics["winner"] = winner
+    metrics["agent_hp"] = agent_hp
+    metrics["opp_hp"] = opp_hp
+    metrics["winners"] = ",".join(winners)
+    metrics["final_phase"] = state.get("phase")
+    if metrics.get("ended_by") == "max_steps" and terminated:
+        metrics["ended_by"] = "terminated"
+    return (
+        obs_list, actions, feature_list, mask_list, rewards, step, winner, agent_hp, opp_hp,
+        p1_key, p2_key, metrics,
+    )
 
 
 def _parallel_worker(
@@ -866,8 +979,10 @@ def _parallel_worker(
 
         if random.random() < self_play_probability:
             opponent = _snapshot_policy(policy, "cpu")
+            opponent_source = "self"
         else:
             opponent = champion
+            opponent_source = "champion"
 
         if deck_keys:
             p1_key, p2_key = _sample_episode_decks(deck_keys)
@@ -877,7 +992,7 @@ def _parallel_worker(
             payload = copy.deepcopy(fixed_payload)
 
         result = _run_worker_episode(env, policy, opponent, player_id, payload, max_steps,
-                                     p1_key=p1_key, p2_key=p2_key)
+                                     p1_key=p1_key, p2_key=p2_key, opponent_source=opponent_source)
         if result and result[0]:
             out_queue.put(result)
 
@@ -960,7 +1075,7 @@ def _train_parallel(
             result = results.get(timeout=1.0)
         except queue.Empty:
             continue
-        obs_list, actions, feat_list, mask_list, rewards, steps, winner, agent_hp, opp_hp, p1_key, p2_key = result
+        obs_list, actions, feat_list, mask_list, rewards, steps, winner, agent_hp, opp_hp, p1_key, p2_key, episode_metrics = result
         episodes_done += 1
         last_episode_number = start_episode + episodes_done
         total_steps += steps
@@ -1010,13 +1125,31 @@ def _train_parallel(
         board.scalar("episode/agent_return", agent_reward, last_episode_number)
         board.scalar("episode/steps", steps, last_episode_number)
         board.scalar("episode/win", 1.0 if winner == "agent" else 0.0, last_episode_number)
+        # Write the SAME schema as the serial loop: the dashboards and notebooks
+        # (visu.load_episode_summaries) read opponent_rewards / agent_turns /
+        # ended_by from this CSV, and the header comes from the first record.
+        opponent_reward_total = float(episode_metrics.get("opponent_rewards") or 0.0)
+        agent_reward_total = float(episode_metrics.get("agent_rewards") or agent_reward)
+        agent_turns = int(episode_metrics.get("agent_turns") or 0)
+        opponent_turns = int(episode_metrics.get("opponent_turns") or 0)
         logger.record_episode_summary({
+            **episode_metrics,
             "episode": last_episode_number,
             "winner": winner,
             "steps": steps,
-            "agent_rewards": agent_reward,
+            "agent_rewards": agent_reward_total,
+            "opponent_rewards": opponent_reward_total,
+            "agent_hp": agent_hp,
+            "opp_hp": opp_hp,
             "p1_key": p1_key,
             "p2_key": p2_key,
+            "agent_reward_per_turn": agent_reward_total / max(1, agent_turns),
+            "opponent_reward_per_turn": opponent_reward_total / max(1, opponent_turns),
+            "avg_valid_actions": int(episode_metrics.get("valid_actions_sum") or 0) / max(1, int(episode_metrics.get("valid_actions_count") or 0)),
+            "avg_agent_valid_actions": int(episode_metrics.get("agent_valid_actions_sum") or 0) / max(1, int(episode_metrics.get("agent_valid_actions_count") or 0)),
+            "cards_played_per_turn": int(episode_metrics.get("cards_played") or 0) / max(1, agent_turns + opponent_turns),
+            "last_tournament_win_rate": last_tournament["candidate_win_rate"] if last_tournament else None,
+            "promotions": promotions,
         })
 
         # ── A2C update ──

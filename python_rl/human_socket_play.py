@@ -17,10 +17,11 @@ import threading
 import time
 
 import agent as agent_mod
+from distribution import remaining_hp, validate_allocation
 
 # Card fields worth keeping for bc_train.py — drops image urls, cosmetics,
 # chat, decklist blobs, etc. (a full GUI state is ~15 kB/step; this is ~1 kB).
-_CARD_KEYS = ("uuid", "id", "name", "power", "hp", "damage", "exhausted", "sentinel", "zone", "selectable")
+_CARD_KEYS = ("uuid", "id", "name", "power", "hp", "remainingHp", "printedHp", "damage", "exhausted", "sentinel", "zone", "selectable")
 
 
 def _slim_card(card) -> dict:
@@ -42,6 +43,9 @@ def _slim_gui_state(state: dict) -> dict:
             "id": ps.get("id"),
             "base": _slim_card(ps.get("base")),
             "leader": _slim_card(ps.get("leader")),
+            # The browser serializer publishes `leaders` (a deck may run two);
+            # the singular key above is kept for older recordings.
+            "leaders": [_slim_card(card) for card in (ps.get("leaders") or []) if isinstance(card, dict)],
             "credits": ps.get("credits"),
             "availableResources": ps.get("availableResources"),
             "numCardsInDeck": ps.get("numCardsInDeck"),
@@ -72,6 +76,9 @@ class HumanSocketSeat(agent_mod.QueueBotClient):
         # can still deliver stale/out-of-order packets showing these prompts —
         # they must never be re-displayed.
         self._resolved_prompts: set = set()
+        # promptUuids we already dumped a diagnostic for (prompt offered
+        # nothing clickable — see _dump_empty_prompt).
+        self._empty_prompt_dumps: set = set()
 
     _COLORS = {"green": "\033[32m", "cyan": "\033[36m", "yellow": "\033[33m", "red": "\033[31m", "reset": "\033[0m"}
 
@@ -133,9 +140,20 @@ class HumanSocketSeat(agent_mod.QueueBotClient):
         # (re-clicking in a multi-select prompt toggles the selection off).
         # Exception: when our card click was never acknowledged by the server
         # (we're still pending the done press), it was dropped — re-send once.
-        if action.get("actionType") == "clickCard":
+        action_type = action.get("actionType")
+        if action_type == "clickCard":
             return self._pending_done is not None
-        return action.get("actionType") in {"clickPrompt", "statefulPromptResults", "menuButton"}
+        if action_type in {"clickPrompt", "menuButton"}:
+            arg = str(action.get("arg") or "")
+            prompt = self._current_prompt()
+            button_args = {str(b.get("arg") or "") for b in (prompt.get("buttons") or []) if isinstance(b, dict)}
+            dropdowns = {str(option) for option in (prompt.get("dropdownListOptions") or [])}
+            if arg not in button_args and arg not in dropdowns:
+                # A display-card selection is sent as menuButton(<card uuid>).
+                # Re-sending it would toggle the card back OFF.
+                return False
+            return True
+        return action_type == "statefulPromptResults"
 
     def _watchdog_fired(self, sig) -> None:
         with self.action_lock:
@@ -151,7 +169,7 @@ class HumanSocketSeat(agent_mod.QueueBotClient):
                 return
             # Otherwise: re-display the prompt.
             self.last_state_signature = None
-        print("  (no state change from the server — your click may have been ignored; re-picking)")
+        print("  (no visible change — re-picking the current prompt)")
         self._maybe_take_action()
 
     def _done_enabled(self, prompt_state: dict) -> bool:
@@ -163,20 +181,46 @@ class HumanSocketSeat(agent_mod.QueueBotClient):
         )
 
     def _state_sig(self, state: dict, prompt_state: dict) -> tuple:
-        # Noise-immune prompt signature: only changes that mean "this is a NEW
-        # question for the human" trigger a re-display. The full prompt JSON is
-        # full of noise — button text flips (Skip -> Confirm), playerIsNewlyActive
-        # toggles, etc. — which is what was re-displaying every prompt twice.
+        # Noise-immune but content-aware. Cosmetic churn (playerIsNewlyActive
+        # flipping, a button's text changing) must not re-display the prompt —
+        # that was doubling every prompt. But a changed prompt *content* MUST
+        # re-display it: e.g. a "put cards on top in any order" prompt shrinks
+        # its displayCards after each per-card click, and ignoring that made the
+        # client think its click did nothing and stop prompting.
+        selectable = tuple(sorted(
+            str(card.get("uuid"))
+            for card in self._collect_selectable_cards(state)
+            if card.get("uuid")
+        ))
         selected = tuple(sorted(
             str(card.get("uuid"))
             for card in self._collect_selectable_cards(state)
             if card.get("selected")
         ))
+        display = tuple(
+            (str(card.get("cardUuid") or card.get("uuid") or ""), str(card.get("selectionState") or ""))
+            for card in (prompt_state.get("displayCards") or [])
+            if isinstance(card, dict)
+        )
+        per_card_buttons = tuple(
+            str(button.get("arg") or button.get("text") or "")
+            for button in (prompt_state.get("perCardButtons") or [])
+            if isinstance(button, dict)
+        )
+        buttons = tuple(
+            (str(button.get("text") or ""), str(button.get("arg") or ""), bool(button.get("disabled")))
+            for button in (prompt_state.get("buttons") or [])
+            if isinstance(button, dict)
+        )
         return (
             prompt_state.get("promptUuid"),
             prompt_state.get("promptType"),
             prompt_state.get("menuTitle"),
+            selectable,
             selected,
+            display,
+            per_card_buttons,
+            buttons,
         )
 
     def _maybe_take_action(self) -> None:
@@ -220,6 +264,8 @@ class HumanSocketSeat(agent_mod.QueueBotClient):
 
             action = self._choose_action(state, prompt_state)
             if not action:
+                if not self.game_over and not self._build_candidates(state, prompt_state):
+                    self._dump_empty_prompt(state, prompt_state)
                 return
             self._emit_action(action)
             self._last_emit = (action, 1)
@@ -244,23 +290,50 @@ class HumanSocketSeat(agent_mod.QueueBotClient):
         pass  # we print our own candidates
 
     def _card_index(self, state: dict) -> dict[str, tuple[str, str, dict]]:
-        """uuid -> (owner, zone, card) across both players."""
-        index: dict = {}
-        players = state.get("players") or {}
-        for pid, ps in players.items():
-            if not isinstance(ps, dict):
+        """uuid -> (owner, zone, card) across both players (leaders included)."""
+        return super()._card_index(state)
+
+    @staticmethod
+    def _prompt_card_uuids(state: dict, prompt_state: dict) -> set:
+        """Every card uuid the prompt currently offers (display + selectable)."""
+        uuids: set[str] = set()
+        for card in (prompt_state.get("displayCards") or []):
+            if isinstance(card, dict):
+                uuid = str(card.get("cardUuid") or card.get("uuid") or "")
+                if uuid:
+                    uuids.add(uuid)
+        for card in (state.get("players") or {}).values():
+            if not isinstance(card, dict):
                 continue
-            owner = "you" if str(pid) == str(self.player_id) else "opp"
-            piles = ps.get("cardPiles") or {}
-            for key in ("hand", "spaceArena", "groundArena", "resources", "discard"):
-                for card in (piles.get(key) or []):
-                    if isinstance(card, dict) and card.get("uuid"):
-                        index[str(card["uuid"])] = (owner, key, card)
-            for key in ("leader", "base"):
-                card = ps.get(key)
-                if isinstance(card, dict) and card.get("uuid"):
-                    index[str(card["uuid"])] = (owner, key, card)
-        return index
+            for pile in (card.get("cardPiles") or {}).values():
+                for entry in (pile or []):
+                    if isinstance(entry, dict) and entry.get("selectable") and entry.get("uuid"):
+                        uuids.add(str(entry["uuid"]))
+            for entry in agent_mod.iter_leader_cards(card):
+                if entry.get("selectable"):
+                    uuids.add(str(entry["uuid"]))
+            base = card.get("base")
+            if isinstance(base, dict) and base.get("selectable") and base.get("uuid"):
+                uuids.add(str(base["uuid"]))
+        return uuids
+
+    def _dump_empty_prompt(self, state: dict, prompt_state: dict) -> None:
+        """One-shot diagnostic when a prompt offers us nothing clickable."""
+        prompt_uuid = str(prompt_state.get("promptUuid") or "")
+        if prompt_uuid in self._empty_prompt_dumps:
+            return
+        self._empty_prompt_dumps.add(prompt_uuid)
+        print(f"  (no clickable option for prompt {prompt_state.get('menuTitle')!r} "
+              f"type={prompt_state.get('promptType')!r})")
+        try:
+            with open("prompt_debug_gui.jsonl", "a", encoding="utf-8") as handle:
+                handle.write(json.dumps({
+                    "prompt": prompt_state,
+                    "state": _slim_gui_state(state),
+                }) + "\n")
+            print("  (prompt state dumped to prompt_debug_gui.jsonl)")
+        except Exception as exc:
+            print(f"  (could not dump prompt state: {exc})")
 
     def _candidate_label(self, state: dict, candidate: dict) -> str:
         """Card candidates get a [zone] / (opp) / EX tag so two identical
@@ -311,13 +384,16 @@ class HumanSocketSeat(agent_mod.QueueBotClient):
             return f"{name}{stats}{mark}"
 
         base = ps.get("base") or {}
-        leader = ps.get("leader") or {}
         print(f"  hand: {[card_line(c, with_cost=True) for c in (piles.get('hand') or []) if card_line(c, with_cost=True)]}")
         print(f"  base: {base.get('name') or '?'} {base.get('hp')} | "
               f"resources: {ps.get('availableResources', '?')} ready | credits: {ps.get('credits', '?')} | "
               f"deck: {ps.get('numCardsInDeck', '?')}")
-        if leader:
-            print(f"  leader: {card_line(leader)}")
+        # `leaders` (array) is what the browser serializer sends; older
+        # recordings and the RL env use a singular `leader`.
+        for leader in agent_mod.iter_leader_cards(ps):
+            line = card_line(leader)
+            if line:
+                print(f"  leader: {line}" + ("  [clickable]" if leader.get("selectable") else ""))
         for arena in ("groundArena", "spaceArena"):
             mine = [card_line(c) for c in (piles.get(arena) or []) if card_line(c)]
             print(f"  {arena}: {mine}")
@@ -331,7 +407,7 @@ class HumanSocketSeat(agent_mod.QueueBotClient):
         except Exception:
             questionary = None
         if questionary is not None:
-            choice = questionary.select(title, choices=labels + ["(quit)"]).ask()
+            choice = questionary.select(title, choices=labels).ask()# + ["(quit)"]
             if choice in (None, "(quit)"):
                 self.game_over = True
                 return None
@@ -371,8 +447,166 @@ class HumanSocketSeat(agent_mod.QueueBotClient):
         player_state = (current.get("players") or {}).get(str(self.player_id)) or {}
         return player_state.get("promptState") or {}
 
+    # ── distribute among targets ─────────────────────────────────────────────
+
+    def _distribution_targets(self, state, prompt_state):
+        """[(card, is_friendly)] for the legal targets the SERVER marked."""
+        index = self._card_index(state)
+        uuids = [str(uuid) for uuid in (prompt_state.get("selectableCards") or []) if uuid]
+        entries = []
+        seen: set = set()
+        if uuids:
+            for uuid in uuids:
+                found = index.get(uuid)
+                if found and uuid not in seen:
+                    seen.add(uuid)
+                    entries.append((found[2], found[0] == "you"))
+        else:
+            for card in self._collect_selectable_cards(state):
+                uuid = str(card.get("uuid") or "")
+                if not uuid or uuid in seen:
+                    continue
+                seen.add(uuid)
+                found = index.get(uuid)
+                entries.append((card, (found[0] == "you") if found else True))
+        return entries
+
+    @staticmethod
+    def _distribution_action(prompt_state, distribution_type, distribution):
+        return {
+            "kind": "statefulPromptResults",
+            "actionType": "statefulPromptResults",
+            "uuid": prompt_state.get("promptUuid"),
+            "result": {"type": distribution_type, "valueDistribution": distribution},
+            "description": f"statefulPromptResults {distribution_type}",
+        }
+
+    @staticmethod
+    def _parse_allocation(raw: str, num_targets: int):
+        parts = raw.replace(",", " ").replace(":", "=").split()
+        if not parts:
+            return None
+        if all("=" not in part for part in parts):
+            try:
+                values = [int(part) for part in parts]
+            except ValueError:
+                return None
+            if len(values) > num_targets:
+                return None
+            return {i: value for i, value in enumerate(values)}
+        allocation: dict = {}
+        for part in parts:
+            if "=" not in part:
+                return None
+            left, _, right = part.partition("=")
+            try:
+                index, value = int(left), int(right)
+            except ValueError:
+                return None
+            if not 0 <= index < num_targets:
+                return None
+            allocation[index] = value
+        return allocation
+
+    @staticmethod
+    def _even_allocation(entry_count: int, amount: int, max_targets) -> dict:
+        limit = entry_count
+        if max_targets:
+            limit = min(limit, int(max_targets))
+        allocation: dict = {}
+        for step in range(amount):
+            allocation[step % limit] = allocation.get(step % limit, 0) + 1
+        return allocation
+
+    def _choose_distribution(self, state, prompt_state):
+        """Interactive allocation for a distribute-among-targets prompt."""
+        prompt = prompt_state.get("distributeAmongTargets") or {}
+        dtype = str(prompt.get("type") or "")
+        amount = int(prompt.get("amount") or 0)
+        can_less = bool(prompt.get("canDistributeLess"))
+        can_none = bool(prompt.get("canChooseNoTargets"))
+        max_targets = int(prompt["maxTargets"]) if prompt.get("maxTargets") else None
+        kind = {
+            "distributeDamage": "damage",
+            "distributeIndirectDamage": "indirect damage",
+            "distributeHealing": "healing",
+            "distributeTokenUpgrade": "token upgrades",
+        }.get(dtype, dtype)
+
+        entries = self._distribution_targets(state, prompt_state)
+        if not entries:
+            if can_none:
+                print("  (no legal targets — distributing nothing)")
+                return self._distribution_action(prompt_state, dtype, [])
+            print("  (no legal targets for this distribution)")
+            return None
+        cards_by_uuid = {str(card.get("uuid")): card for card, _friendly in entries}
+
+        def label(index_: int) -> str:
+            card, friendly = entries[index_]
+            hp = remaining_hp(card)
+            hp_text = f" {hp}hp" if hp is not None else ""
+            return f"{card.get('name') or card.get('uuid')}{hp_text} ({'yours' if friendly else 'opp'})"
+
+        print(f"\n  Distribute {amount} {kind}"
+              + (f" to up to {max_targets} target(s)" if max_targets else "")
+              + (" — may distribute less" if can_less else "")
+              + (" — may choose nothing" if can_none else ""))
+        for i in range(len(entries)):
+            print(f"   [{i}] {label(i)}")
+        print("  amounts like `1=2 3=2`, a bare list `2 2`, or `even` / `all` / `none` / `done`")
+
+        allocation: dict = {}
+        while True:
+            try:
+                raw = input("  distribute> ").strip().lower()
+            except EOFError:
+                return None
+            if raw in {"q", "quit", "exit"}:
+                self.game_over = True
+                return None
+            if raw in {"r", "refresh"}:
+                return None
+            if raw in {"even", "spread"}:
+                allocation = self._even_allocation(len(entries), amount, max_targets)
+            elif raw == "all":
+                allocation = {0: amount}
+            elif raw in {"none", "no"}:
+                if not can_none:
+                    print("  you must distribute something")
+                    continue
+                allocation = {}
+            elif raw not in {"", "done", "d"}:
+                parsed = self._parse_allocation(raw, len(entries))
+                if parsed is None:
+                    print("  couldn't parse that — try `1=2 3=2`, `2 2`, `even`, `all`, `none`")
+                    continue
+                allocation = parsed
+
+            by_uuid = {str(entries[i][0].get("uuid")): int(value) for i, value in allocation.items()}
+            error = validate_allocation(prompt, by_uuid, cards_by_uuid)
+            if error:
+                current = " ".join(f"{i}={v}" for i, v in sorted(allocation.items()) if v) or "nothing"
+                print(f"  invalid: {error} (current: {current})")
+                continue
+            break
+
+        distribution = [
+            {"uuid": str(entries[i][0].get("uuid")), "amount": int(value)}
+            for i, value in sorted(allocation.items()) if int(value) > 0
+        ]
+        summary = ", ".join(f"{value} -> {label(i)}" for i, value in sorted(allocation.items()) if value) or "nothing"
+        print(f"  distributing: {summary}")
+        return self._distribution_action(prompt_state, dtype, distribution)
+
     def _choose_action(self, state, prompt_state):
         self._print_board(state)
+        if prompt_state.get("promptType") == "distributeAmongTargets" and prompt_state.get("distributeAmongTargets"):
+            action = self._choose_distribution(state, prompt_state)
+            if action is None:
+                return None
+            self._record_action(state, action, None)
+            return action
         candidates = self._build_candidates(state, prompt_state)
         if not candidates:
             return None
@@ -402,8 +636,9 @@ class HumanSocketSeat(agent_mod.QueueBotClient):
             stable_sig = sig
             time.sleep(0.15)
         cur_prompt = self._current_prompt()
-        if self._prompt_sig(cur_prompt) != self._prompt_sig(prompt_state):
-            print("  board changed while choosing — re-picking…")
+        if (self._prompt_sig(cur_prompt) != self._prompt_sig(prompt_state)
+                or self._state_sig(self.current_state or state, cur_prompt) != self._state_sig(state, prompt_state)):
+            print("  prompt changed while choosing — re-picking…")
             return self._choose_action(self.current_state or state, cur_prompt)
 
         # Hold the click until the engine's current pipeline step belongs to us.
@@ -412,19 +647,38 @@ class HumanSocketSeat(agent_mod.QueueBotClient):
         # crazy" bug.
         waited_hint = False
         hold_deadline = time.time() + 15.0
+        wanted_uuid = prompt_state.get("promptUuid")
         while True:
-            owner = (self.current_state or {}).get("activePromptPlayerId")
+            state_now = self.current_state or {}
+            owner = state_now.get("activePromptPlayerId")
+            current_uuid = self._current_prompt().get("promptUuid")
             if owner is None or str(owner) == str(self.player_id):
+                break
+            if wanted_uuid and current_uuid and str(current_uuid) != str(wanted_uuid):
+                # The prompt we answered is no longer on screen — don't hold
+                # for a stale one.
                 break
             if not waited_hint:
                 print("  (holding — waiting for the opponent to finish their action)")
                 waited_hint = True
             if time.time() > hold_deadline:
-                print("  (timed out waiting for your turn — action dropped)")
-                return None
+                # Emitting is safer than dropping: the server ignores illegal
+                # clicks, and the watchdog re-prompts if nothing changes.
+                print("  (waited 15s for the opponent — sending the action anyway)")
+                break
             time.sleep(0.2)
 
         action = candidates[index]
+        # Stale-prompt guard: display cards are re-dealt and can become
+        # invalid/unselectable between the menu being drawn and the click
+        # landing. Clicking a card the server no longer has in the prompt is
+        # silently rejected (no state change), which looks like a freeze.
+        target = str(action.get("cardUuid") or action.get("arg") or "")
+        if target and target in self._prompt_card_uuids(state, prompt_state):
+            fresh_state = self.current_state or state
+            if target not in self._prompt_card_uuids(fresh_state, self._current_prompt()):
+                print("  that card is no longer part of the prompt — re-picking…")
+                return self._choose_action(fresh_state, self._current_prompt())
         self._record_action(state, action, index)
         return action
 

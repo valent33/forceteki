@@ -8,7 +8,7 @@ import random
 import re
 import threading
 import time
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import quote_plus
 
 import requests
@@ -16,10 +16,11 @@ import socketio
 import torch  # type: ignore[import-not-found]
 from swu_env import SWUEnv, load_card_database
 from deck_utils import load_deck
+from distribution import allocate_distribution
 
 
 QUEUE_FORMAT = "premier"
-QUEUE_CARD_POOL = "current"
+QUEUE_CARD_POOL = "nextSet"
 QUEUE_GAMES_TO_WIN = "bestOfOne"
 
 
@@ -177,6 +178,25 @@ def _card_def(internal_name: Any) -> dict[str, Any]:
     return _CARD_DB_REF.get(name, {})
 
 
+def _card_display_name(card: Any) -> str:
+    """Human-readable name for a card entry from any of our state shapes.
+
+    Prompt `displayCards` entries only carry an `internalName`, so fall back to
+    the card database's title (otherwise menus show e.g. 'hold-for-questioning').
+    """
+    if not isinstance(card, dict):
+        return "?"
+    for key in ("name", "title"):
+        if card.get(key):
+            return str(card[key])
+    internal = card.get("internalName")
+    for key in ("title", "name"):
+        value = _card_def(internal).get(key)
+        if value:
+            return str(value)
+    return str(internal or card.get("cardUuid") or card.get("uuid") or "?")
+
+
 def _num(card: Any, *keys: str, default=None):
     if not isinstance(card, dict):
         return default
@@ -323,12 +343,14 @@ def _build_gui_view(state: dict[str, Any], player_id: str) -> dict[str, Any]:
 
         ground = [unit_row(c) for c in (piles.get("groundArena") or []) if isinstance(c, dict)]
         space = [unit_row(c) for c in (piles.get("spaceArena") or []) if isinstance(c, dict)]
-        leader = pstate.get("leader") or {}
-        leader_zone = str(leader.get("zone") or "").lower()
-        if "ground" in leader_zone:
-            ground.append(unit_row(leader))
-        elif "space" in leader_zone:
-            space.append(unit_row(leader))
+        leader_cards = list(iter_leader_cards(pstate))
+        leader = leader_cards[0] if leader_cards else {}
+        leader_zones = [str(card.get("zone") or "").lower() for card in leader_cards]
+        for card, zone in zip(leader_cards, leader_zones):
+            if "ground" in zone:
+                ground.append(unit_row(card))
+            elif "space" in zone:
+                space.append(unit_row(card))
 
         hand_cards = [c for c in (piles.get("hand") or []) if isinstance(c, dict)]
         hand_names = [str(c.get("name") or "?") for c in hand_cards if c.get("name")]
@@ -344,7 +366,7 @@ def _build_gui_view(state: dict[str, Any], player_id: str) -> dict[str, Any]:
                 "max_hp": None,
             },
             "leader_name": str(leader.get("name") or "?"),
-            "leader_deployed": bool("ground" in leader_zone or "space" in leader_zone),
+            "leader_deployed": any("ground" in zone or "space" in zone for zone in leader_zones),
             "ground": ground,
             "space": space,
             "hand": hand_names,
@@ -371,9 +393,11 @@ def _build_gui_view(state: dict[str, Any], player_id: str) -> dict[str, Any]:
             for card in zone_cards:
                 if isinstance(card, dict) and card.get("selectable"):
                     legal_total += 1
-        for key in ("leader", "base"):
-            card = my_state.get(key)
-            if isinstance(card, dict) and card.get("selectable"):
+        base_card = my_state.get("base")
+        if isinstance(base_card, dict) and base_card.get("selectable"):
+            legal_total += 1
+        for leader_card in iter_leader_cards(my_state):
+            if leader_card.get("selectable"):
                 legal_total += 1
 
     return {
@@ -464,6 +488,26 @@ def render_gui_board(state: dict[str, Any], player_id: str) -> None:
         _render_board_view(_build_gui_view(state, player_id))
     except Exception as exc:  # never let the visualizer crash the agent
         print(f"[debug_vis] render failed: {exc}")
+
+
+def iter_leader_cards(player_state: Any) -> Iterator[dict[str, Any]]:
+    """Yield a GUI player state's leader card(s).
+
+    The browser serializer publishes `leaders` (an ARRAY — a deck may run two
+    leaders), while the RL env serializer uses a singular `leader`. Reading only
+    the singular key made the leader invisible to the scripted clients, so the
+    deploy / leader-ability option was never offered.
+    """
+    if not isinstance(player_state, dict):
+        return
+    candidates: list[Any] = list(player_state.get("leaders") or [])
+    if player_state.get("leader"):
+        candidates.append(player_state.get("leader"))
+    seen: set[str] = set()
+    for card in candidates:
+        if isinstance(card, dict) and card.get("uuid") and str(card["uuid"]) not in seen:
+            seen.add(str(card["uuid"]))
+            yield card
 
 
 class QueueBotClient:
@@ -977,7 +1021,7 @@ class QueueBotClient:
                             "cardUuid": card.get("cardUuid"),
                             "uuid": prompt_uuid,
                             "method": button.get("command") or "perCardMenuButton",
-                            "description": f"{button.get('text', 'button')} on {card.get('name') or card.get('internalName') or card.get('cardUuid')}",
+                            "description": f"{button.get('text', 'button')} on {_card_display_name(card)}",
                             "features": {"is_card": 1.0},
                         })
             else:
@@ -988,7 +1032,7 @@ class QueueBotClient:
                         "arg": card.get("cardUuid"),
                         "uuid": prompt_uuid,
                         "method": "menuButton",
-                        "description": f"select card {card.get('name') or card.get('internalName') or card.get('cardUuid')}",
+                        "description": f"select card {_card_display_name(card)}",
                         "cardUuid": card.get("cardUuid"),
                         "features": {"is_card": 1.0},
                     })
@@ -1206,7 +1250,7 @@ class QueueBotClient:
             return {
                 "id": pid,
                 "base": convert_card(ps.get("base")) or {"hp": 30},
-                "leader": convert_card(ps.get("leader")),
+                "leader": convert_card(next(iter_leader_cards(ps), None)),
                 "hand": [convert_card(c) for c in (piles.get("hand") or []) if isinstance(c, dict)],
                 "spaceArena": [convert_card(c) for c in (piles.get("spaceArena") or []) if isinstance(c, dict)],
                 "groundArena": [convert_card(c) for c in (piles.get("groundArena") or []) if isinstance(c, dict)],
@@ -1238,13 +1282,17 @@ class QueueBotClient:
                         selectable.append(str(card["uuid"]))
                     if card.get("selected"):
                         selected.append(str(card["uuid"]))
-            for key in ("leader", "base"):
-                card = ps.get(key)
-                if isinstance(card, dict) and card.get("uuid"):
-                    if card.get("selectable"):
-                        selectable.append(str(card["uuid"]))
-                    if card.get("selected"):
-                        selected.append(str(card["uuid"]))
+            for card in iter_leader_cards(ps):
+                if card.get("selectable"):
+                    selectable.append(str(card["uuid"]))
+                if card.get("selected"):
+                    selected.append(str(card["uuid"]))
+            base_card = ps.get("base")
+            if isinstance(base_card, dict) and base_card.get("uuid"):
+                if base_card.get("selectable"):
+                    selectable.append(str(base_card["uuid"]))
+                if base_card.get("selected"):
+                    selected.append(str(base_card["uuid"]))
             return {
                 "menuTitle": pstate.get("menuTitle"),
                 "promptUuid": pstate.get("promptUuid"),
@@ -1352,10 +1400,12 @@ class QueueBotClient:
             if not isinstance(player_state, dict):
                 continue
 
-            if self._matches_card_uuid(player_state.get("leader"), card_uuid):
-                return player_state.get("leader"), owner_id == self.player_id
-            if self._matches_card_uuid(player_state.get("base"), card_uuid):
-                return player_state.get("base"), owner_id == self.player_id
+            for card in iter_leader_cards(player_state):
+                if self._matches_card_uuid(card, card_uuid):
+                    return card, owner_id == self.player_id
+            base_card = player_state.get("base")
+            if self._matches_card_uuid(base_card, card_uuid):
+                return base_card, owner_id == self.player_id
 
             card_piles = player_state.get("cardPiles") or {}
             if isinstance(card_piles, dict):
@@ -1458,76 +1508,101 @@ class QueueBotClient:
                     if isinstance(card, dict) and card.get("selectable"):
                         cards.append(card)
 
-            for key in ("leader", "base"):
-                card = player_state.get(key)
-                if isinstance(card, dict) and card.get("selectable"):
+            for card in iter_leader_cards(player_state):
+                if card.get("selectable"):
                     cards.append(card)
+
+            base = player_state.get("base")
+            if isinstance(base, dict) and base.get("selectable"):
+                cards.append(base)
 
         return cards
 
-    def _build_distribution_results(self, state: dict[str, Any], prompt_state: dict[str, Any]) -> dict[str, Any] | None:
-        distribute_prompt = prompt_state.get("distributeAmongTargets") or {}
-        amount = distribute_prompt.get("amount", 0)
-        distribution_type = distribute_prompt.get("type")
-
-        if amount <= 0 or not distribution_type:
-            return None
-
-        candidate_cards = self._distribution_candidates(state, prompt_state)
-        if not candidate_cards:
-            if distribute_prompt.get("canChooseNoTargets"):
-                return {"type": distribution_type, "valueDistribution": []}
-            return None
-
-        max_targets = distribute_prompt.get("maxTargets") or 1
-        chosen_cards = candidate_cards[:max_targets]
-        if not chosen_cards:
-            return None
-
-        # Absorb the damage on the highest-remaining-HP target first (usually
-        # a base at 25-30 HP): concentrating damage minimizes unit losses.
-        def _card_hp(card: dict[str, Any]) -> float:
-            try:
-                return float(card.get("hp") or card.get("remainingHp") or card.get("currentHp") or 0.0)
-            except Exception:
-                return 0.0
-
-        candidate_cards.sort(key=_card_hp, reverse=True)
-        is_indirect_damage = distribution_type == "distributeIndirectDamage"
-        value_distribution = []
-        remaining = int(amount)
-        for card in candidate_cards:
-            if remaining <= 0:
-                break
-            if max_targets is not None and len(value_distribution) >= int(max_targets):
-                break
-            cap = remaining
-            if is_indirect_damage:
-                hp = _card_hp(card)
-                if hp > 0:
-                    cap = min(cap, int(hp))
-            if cap <= 0:
+    def _card_index(self, state: dict[str, Any]) -> dict[str, tuple[str, str, dict[str, Any]]]:
+        """uuid -> (owner, zone, card) across both players of a GUI state."""
+        index: dict[str, tuple[str, str, dict[str, Any]]] = {}
+        players = state.get("players") or {}
+        if not isinstance(players, dict):
+            return index
+        for pid, player_state in players.items():
+            if not isinstance(player_state, dict):
                 continue
-            value_distribution.append({"uuid": card.get("uuid"), "amount": cap})
-            remaining -= cap
+            owner = "you" if str(pid) == str(self.player_id) else "opp"
+            piles = player_state.get("cardPiles") or {}
+            if isinstance(piles, dict):
+                for zone, pile_cards in piles.items():
+                    for card in (pile_cards or []):
+                        if isinstance(card, dict) and card.get("uuid"):
+                            index[str(card["uuid"])] = (owner, str(zone), card)
+            for card in iter_leader_cards(player_state):
+                index[str(card["uuid"])] = (owner, "leader", card)
+            base = player_state.get("base")
+            if isinstance(base, dict) and base.get("uuid"):
+                index[str(base["uuid"])] = (owner, "base", base)
+        return index
 
-        if remaining > 0 and not distribute_prompt.get("canDistributeLess"):
+    def _build_distribution_results(self, state: dict[str, Any], prompt_state: dict[str, Any]) -> dict[str, Any] | None:
+        """Valid, type-aware allocation of a distribute-among-targets prompt."""
+        distribute_prompt = prompt_state.get("distributeAmongTargets") or {}
+        distribution_type = distribute_prompt.get("type")
+        try:
+            amount = int(distribute_prompt.get("amount") or 0)
+        except (TypeError, ValueError):
+            amount = 0
+        if not distribution_type or amount <= 0:
             return None
 
-        if not value_distribution and not distribute_prompt.get("canChooseNoTargets"):
+        allocation = allocate_distribution(distribute_prompt, self._distribution_targets(state, prompt_state))
+        if allocation is None:
             return None
+        return {"type": distribution_type, "valueDistribution": allocation}
 
-        return {
-            "type": distribution_type,
-            "valueDistribution": value_distribution,
-        }
+    def _distribution_targets(self, state: dict[str, Any], prompt_state: dict[str, Any]) -> list[tuple[dict[str, Any], bool]]:
+        """[(card, is_friendly)] legal targets for a distribute prompt.
+
+        The server publishes the legal target list through promptState
+        `selectableCards` (uuids) / card-level `selectable` flags; the old code
+        guessed from whichever cards it could see.
+        """
+        index = self._card_index(state)
+        selected_uuids = [str(uuid) for uuid in (prompt_state.get("selectableCards") or []) if uuid]
+        display_cards = [
+            card for card in (prompt_state.get("displayCards") or [])
+            if isinstance(card, dict) and str(card.get("selectionState", "")).lower() not in {"invalid", "unselectable", "viewonly"}
+        ]
+
+        picked: list[dict[str, Any]] = []
+        if selected_uuids:
+            for uuid in selected_uuids:
+                found = index.get(uuid)
+                if found:
+                    picked.append(found[2])
+        elif display_cards:
+            for entry in display_cards:
+                uuid = str(entry.get("cardUuid") or entry.get("uuid") or "")
+                found = index.get(uuid)
+                picked.append(found[2] if found else entry)
+        else:
+            picked = [card for card in self._collect_selectable_cards(state) if card.get("uuid")]
+
+        targets: list[tuple[dict[str, Any], bool]] = []
+        seen: set[str] = set()
+        for card in picked:
+            uuid = str(card.get("uuid") or "")
+            if not uuid or uuid in seen:
+                continue
+            seen.add(uuid)
+            found = index.get(uuid)
+            owner = found[0] if found else None
+            if card.get("controllerId") is not None:
+                friendly = str(card.get("controllerId")) == str(self.player_id)
+            else:
+                friendly = owner == "you"
+            targets.append((card, friendly))
+        return targets
 
     def _distribution_candidates(self, state: dict[str, Any], prompt_state: dict[str, Any]) -> list[dict[str, Any]]:
-        display_cards = prompt_state.get("displayCards") or []
-        if display_cards:
-            return [card for card in display_cards if isinstance(card, dict) and card.get("selectionState") != "invalid"]
-
-        return self._collect_selectable_cards(state)
+        return [card for card, _friendly in self._distribution_targets(state, prompt_state)]
 
     def _emit_action(self, action: dict[str, Any]) -> None:
         action_type = action["actionType"]
