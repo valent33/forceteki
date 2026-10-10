@@ -64,8 +64,11 @@ def create_app(run_dir: Path) -> Dash:
     app.layout = dbc.Container([
         dbc.Row([
             dbc.Col(html.H3(f"Turn Dashboard — {run_dir.name}", className="mt-3 mb-0"), width=8),
-            dbc.Col(html.P(f"{stats['n_episodes']} episodes · turns {turns_available[0]}–{turns_available[-1]}",
-                           className="text-muted mt-3 mb-0 text-end"), width=4),
+            dbc.Col(html.P(
+                f"{stats['n_episodes']} episodes"
+                + (f" · turns {turns_available[0]}–{turns_available[-1]}" if turns_available else " · no turn data"),
+                className="text-muted mt-3 mb-0 text-end",
+            ), width=4),
         ]),
         html.Hr(),
 
@@ -85,7 +88,8 @@ def create_app(run_dir: Path) -> Dash:
                 html.Label("Turn number", className="fw-bold"),
                 dcc.Slider(
                     id="turn-slider",
-                    min=turns_available[0], max=turns_available[-1],
+                    min=turns_available[0] if turns_available else 0,
+                    max=turns_available[-1] if turns_available else 1,
                     step=1, value=default_turn,
                     marks={t: str(t) for t in turns_available if t % 2 == 0 or t == turns_available[0] or t == turns_available[-1]},
                     tooltip={"placement": "bottom", "always_visible": True},

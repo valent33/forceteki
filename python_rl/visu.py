@@ -43,6 +43,22 @@ def load_episode_summaries(run_dir: Path) -> pd.DataFrame:
     if df.empty:
         raise ValueError(f"Empty file: {csv_path}")
 
+    # Parallel-mode summaries used to be written from a 7-key dict, so most
+    # columns were simply absent. Guarantee the expected schema (as NaN) so
+    # downstream code — notebook cells included — can index it without KeyError.
+    had_opponent_rewards = "opponent_rewards" in df.columns
+    expected_columns = [
+        "steps", "agent_turns", "opponent_turns", "agent_rewards", "opponent_rewards",
+        "total_rewards", "total_reward_steps", "valid_actions_sum", "valid_actions_count",
+        "agent_valid_actions_sum", "agent_valid_actions_count", "agent_max_valid_actions",
+        "cards_played", "agent_cards_played", "agent_base_hp_sum", "opp_base_hp_sum",
+        "agent_board_power_sum", "opp_board_power_sum", "agent_unit_count_sum", "opp_unit_count_sum",
+        "cancel_clicks", "pass_clicks", "done_clicks", "attack_clicks", "agent_hp", "opp_hp",
+    ]
+    for column in expected_columns:
+        if column not in df.columns:
+            df[column] = np.nan
+
     df["training_order"] = np.arange(1, len(df) + 1)
     df["episode"] = pd.to_numeric(df["episode"], errors="coerce")
 
@@ -61,7 +77,11 @@ def load_episode_summaries(run_dir: Path) -> pd.DataFrame:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    df["reward_margin"] = df["agent_rewards"] - df["opponent_rewards"]
+    df["reward_margin"] = (
+        df["agent_rewards"] - df["opponent_rewards"]
+        if had_opponent_rewards
+        else df["agent_rewards"]
+    )
 
     # Determine win from actual winner column; fall back to reward margin proxy
     if "winner" in df.columns:
@@ -82,9 +102,15 @@ def load_episode_summaries(run_dir: Path) -> pd.DataFrame:
 
 def load_turn_summaries(run_dir: Path, ep_df: pd.DataFrame | None = None) -> pd.DataFrame:
     csv_path = run_dir / "turn_summaries.csv"
+    empty = pd.DataFrame(columns=["episode", "turn_number", "training_order"])
+    if not csv_path.exists():
+        # Nothing writes turn rows yet (runner.record_turn_summary has no
+        # callers), so degrade to an empty frame instead of killing the whole
+        # dashboard with FileNotFoundError.
+        return empty
     df = pd.read_csv(csv_path)
     if df.empty:
-        raise ValueError(f"Empty file: {csv_path}")
+        return empty
 
     df["episode"] = pd.to_numeric(df["episode"], errors="coerce")
     df["turn_number"] = pd.to_numeric(df["turn_number"], errors="coerce")
@@ -372,15 +398,26 @@ def plot_last_turn_panel(turn_df: pd.DataFrame, window: int = 10) -> go.Figure:
 # ── summary stats ────────────────────────────────────────────────────
 
 def summary_stats(df: pd.DataFrame) -> dict:
+    def mean(column: str, default: float = 0.0) -> float:
+        if column not in df.columns:
+            return default
+        values = pd.to_numeric(df[column], errors="coerce")
+        return float(values.mean()) if values.notna().any() else default
+
+    margin = pd.to_numeric(df.get("reward_margin"), errors="coerce") if "reward_margin" in df.columns else None
+    has_margin = margin is not None and margin.notna().any()
+
     return {
         "n_episodes":       len(df),
-        "win_rate":         float(df["agent_win"].mean()),
-        "avg_agent_reward": float(df["agent_rewards"].mean()),
-        "avg_reward_margin":float(df["reward_margin"].mean()),
-        "avg_steps":        float(df["steps"].mean()),
-        "avg_turns":        float(df["agent_turns"].mean()),
-        "best_margin_ep":   int(df.loc[df["reward_margin"].idxmax(), "episode"]),
-        "best_margin":      float(df["reward_margin"].max()),
-        "worst_margin_ep":  int(df.loc[df["reward_margin"].idxmin(), "episode"]),
-        "worst_margin":     float(df["reward_margin"].min()),
+        "win_rate":         float(df["agent_win"].mean()) if "agent_win" in df.columns and len(df) else 0.0,
+        "avg_agent_reward": mean("agent_rewards"),
+        "avg_reward_margin":mean("reward_margin"),
+        "avg_steps":        mean("steps"),
+        # `agent_turns` only exists in serial-style summaries — parallel runs
+        # before this fix wrote a 7-column CSV without it.
+        "avg_turns":        mean("agent_turns"),
+        "best_margin_ep":   int(df.loc[margin.idxmax(), "episode"]) if has_margin else 0,
+        "best_margin":      float(margin.max()) if has_margin else 0.0,
+        "worst_margin_ep":  int(df.loc[margin.idxmin(), "episode"]) if has_margin else 0,
+        "worst_margin":     float(margin.min()) if has_margin else 0.0,
     }
